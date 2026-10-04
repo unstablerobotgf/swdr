@@ -83,12 +83,48 @@ python ../tools/fsk_check.py capture_iq.u8
 PASS needs four tones at 3.2 kHz spacing (checks tuning, sample rate and sample integrity together).
 Last result: spacing 3.17/3.23/3.17 kHz, carrier offset −1.87 ppm, weakest tone 27 dB over floor.
 
+## P25 control channel decoder
+
+The firmware can decode P25 Phase 1 control channels (TSBKs) on its own and print them on the VCP:
+
+```sh
+cd firmware
+SWDR_P25_FREQ=851975000 cargo run --release --features p25   # boots straight into decoding
+```
+
+Output, one line per CRC-valid TSBK (VCP, 2 Mbaud 8N1):
+
+```
+TSBK nac=00a op=3a mfid=00 lb=1 ba000a300a0a0a009b70f8e1 e=1
+```
+
+`nac` is the network access code, `op` the TSBK opcode, `lb` the last-block flag, then the 12 raw
+TSBK bytes (CRC included) and the number of bit errors the trellis decoder corrected. Without the
+`p25` feature, mode command `op 4 = 4` switches a running board into the decoder.
+
+Signal path:
+
+- MRSUBG is configured for 4-FSK at 4800 sym/s, deviation 1800 Hz (inner symbols at FDEV/3) and a
+  12.5 kHz channel filter. `FOUR_GFSK_CONST_MAP = 2` matches the P25 dibit mapping.
+- The radio's frequency-detector tap (`RX_MODE=100`, i8 at 15625 S/s) feeds `firmware/src/p25.rs`:
+  a 16-phase integrate-and-dump symbol bank sharing one boundary grid, frame sync on symbol signs,
+  a per-frame least-squares fit on the 24 sync symbols for DC and scale, status-symbol removal,
+  deinterleave, hard-decision Viterbi and CRC-16/GSM.
+- The radio's own hard-decision 4-FSK output (`RX_MODE=001`) also works, but recovered about 60% of
+  TSBKs against a continuous control channel, so it is not used.
+
+Validation (`tools/p25_ref.py` decodes captured I/Q; `host/examples/p25_offline.rs` runs `p25.rs`
+on a captured frequency-detector tap): on a 20 s capture of a live control channel, the I/Q
+reference decoded 530 TSBKs and `p25.rs` decoded 532 from 533 frame syncs, all with 0 trellis
+errors. Live on hardware: about 30 TSBKs/s.
+
 ## Wire protocol
 
 - Frames (RTT up-channel 1 and VCP): `A5 5A seq:u16 len:u16 rate_exp:u8 shift:u8` then 1024 B of
   u8 I/Q (offset binary, rtl_sdr format). Fs = 2 MHz >> rate_exp.
 - Commands (RTT down-channel 0 or VCP RX): `C5 op arg:u32` little-endian. op 1 = frequency in Hz,
-  2 = rate exponent, 3 = shift.
+  2 = rate exponent, 3 = shift, 4 = mode (0 I/Q; 1 hard bits, 2 frequency detector, 3 soft symbols as
+  raw frames tagged `0xF0 | RX_MODE`; 4 on-board P25 decoder).
 
 ## STM32WL3x findings worth knowing
 

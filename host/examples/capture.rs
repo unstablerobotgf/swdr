@@ -18,6 +18,9 @@ fn main() -> anyhow::Result<()> {
     let hz: u32 = a.first().map(|v| v.parse().unwrap()).unwrap_or(929_612_500);
     let secs: u64 = a.get(1).map(|v| v.parse().unwrap()).unwrap_or(60);
     let shift: u32 = a.get(2).map(|v| v.parse().unwrap()).unwrap_or(4);
+    // 4th arg selects an IP-block P25 tap instead of I/Q: "bits", "freq" (freq detector) or "soft" (soft symbols).
+    let tap: u32 = match a.get(3).map(String::as_str) { Some("bits") => 1, Some("freq") => 2, Some("soft") => 3, _ => 0 };
+    let p25 = tap != 0;
 
     let mut reg = Registry::from_builtin_families();
     reg.add_target_family_from_yaml(&std::fs::read_to_string("../probe/STM32WL3_Series.yaml")?)?;
@@ -27,14 +30,27 @@ fn main() -> anyhow::Result<()> {
     let mut s = p.attach_with_registry("STM32WL33CCVx", Permissions::default(), &reg)?;
     let mut c = s.core(0)?;
     let r = rtt::Rtt::attach(&mut c, 0x2000_0100..0x2000_8000)?;
-    for k in [cmd(2, 3), cmd(1, hz), cmd(3, shift)] {
+    // Drain stale log text first, then require the tune report for *this* frequency.
+    let mut log = vec![0u8; 512];
+    while r.up[0].read(&mut c, &mut log)? > 0 {}
+    // The P25 config sets its own 12.5 kHz channel filter; a rate command after it would override that.
+    // Optional 5th arg: channel-filter exponent for P25 taps (default 7 = 12.5 kHz, set by the mode).
+    let chflt: Option<u32> = a.get(4).map(|v| v.parse().unwrap());
+    let cmds = if p25 { [vec![cmd(4, tap)], chflt.map(|e| vec![cmd(2, e)]).unwrap_or_default(), vec![cmd(1, hz)]].concat() } else { vec![cmd(4, 0), cmd(2, 3), cmd(3, shift), cmd(1, hz)] };
+    for k in cmds {
         r.down[0].write(&mut c, &k)?;
         std::thread::sleep(Duration::from_millis(150));
     }
-    let mut log = vec![0u8; 512];
-    let n = r.up[0].read(&mut c, &mut log)?;
-    let tune = String::from_utf8_lossy(&log[..n]).lines().filter(|l| l.starts_with("tune")).last().unwrap_or("?").to_string();
+    let (mut text, t) = (String::new(), Instant::now());
+    let want = format!("tune {hz} Hz");
+    while !text.contains(&want) && t.elapsed() < Duration::from_secs(3) {
+        let n = r.up[0].read(&mut c, &mut log)?;
+        text.push_str(&String::from_utf8_lossy(&log[..n]));
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let tune = text.lines().find(|l| l.starts_with(&want)).ok_or_else(|| anyhow::anyhow!("no tune report for {hz} Hz; log: {text:?}"))?;
     println!("{tune}");
+    anyhow::ensure!(tune.contains(": locked"), "PLL did not lock at {hz} Hz");
 
     // Capture and deframe (A5 5A seq len rate shift | 1024 B).
     let (mut raw, mut buf, t0) = (Vec::new(), vec![0u8; 32768], Instant::now());
@@ -46,13 +62,20 @@ fn main() -> anyhow::Result<()> {
     }
     let (mut iq, mut i, mut gaps, mut last) = (Vec::<u8>::new(), 0usize, 0, None::<u16>);
     while i + 1032 <= raw.len() {
-        if raw[i] == 0xA5 && raw[i + 1] == 0x5A {
+        if raw[i] == 0xA5 && raw[i + 1] == 0x5A && (raw[i + 6] & 0xF0 == 0xF0) == p25 {
             let seq = u16::from_le_bytes([raw[i + 2], raw[i + 3]]);
             if last.is_some_and(|l| seq != l.wrapping_add(1)) { gaps += 1; }
             last = Some(seq);
             iq.extend_from_slice(&raw[i + 8..i + 1032]);
             i += 1032;
         } else { i += 1; }
+    }
+    if p25 {
+        let name = format!("capture_{}.bin", a[3]);
+        std::fs::write(&name, &iq)?;
+        println!("saved {} B from the {} tap ({:.1} B/s) to {name}", iq.len(), a[3], iq.len() as f64 / secs as f64);
+        let _ = r.down[0].write(&mut c, &cmd(4, 0)); // back to I/Q mode
+        return Ok(());
     }
     std::fs::write("capture_iq.u8", &iq)?; // rtl_sdr-style u8 I/Q for offline analysis
     let ns = iq.len() / 2;

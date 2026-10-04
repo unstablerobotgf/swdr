@@ -1,6 +1,7 @@
 #![no_std]
 #![no_main]
 
+mod p25;
 mod radio;
 mod rcc;
 mod uart;
@@ -19,6 +20,8 @@ use uart::{CmdParser, Frame, Vcp, PAYLOAD};
 
 /// DBM ping-pong half: 512 complex i16 samples -> one 1 KB u8 frame.
 const DB_LEN: usize = 2 * PAYLOAD;
+/// Frame rate_exp tag for raw demod-tap frames (P25 modes): 0xF0 | RX_MODE.
+const TAG_RAW: u8 = 0xF0;
 /// Default 250 kS/s (E=3): fits SWD/RTT (~630 kB/s). The 2 Mbaud VCP only keeps up at E>=5.
 const DEFAULT_RATE_EXP: u8 = 3;
 
@@ -26,6 +29,10 @@ const DEFAULT_RATE_EXP: u8 = 3;
 struct DbBuf([u8; 2 * DB_LEN]);
 static mut DB: DbBuf = DbBuf([0; 2 * DB_LEN]);
 static mut FRAMES: [Frame; 2] = [Frame::new(), Frame::new()];
+static mut P25: p25::Decoder = p25::Decoder::new();
+
+/// Raw-tap mode that runs the on-board P25 TSBK decoder instead of streaming frames.
+const MODE_P25_DECODE: u8 = 4;
 
 static PENDING: AtomicU32 = AtomicU32::new(0);
 static WAKE: Signal<CriticalSectionRawMutex, ()> = Signal::new();
@@ -86,6 +93,34 @@ fn narrow(src: &[u8], dst: &mut [u8], shift: u32) {
     }
 }
 
+/// "TSBK nac=00a op=3a mfid=00 lb=1 <12 bytes hex> e=2" for the VCP.
+fn tsbk_line(t: &p25::Tsbk) -> ([u8; 72], usize) {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut b = [0u8; 72];
+    let mut n = 0;
+    let mut put = |s: &[u8]| {
+        b[n..n + s.len()].copy_from_slice(s);
+        n += s.len();
+    };
+    let h = |v: u8| [HEX[(v >> 4) as usize], HEX[(v & 15) as usize]];
+    put(b"TSBK nac=");
+    put(&[HEX[(t.nac >> 8) as usize & 15]]);
+    put(&h(t.nac as u8));
+    put(b" op=");
+    put(&h(t.bytes[0] & 0x3F));
+    put(b" mfid=");
+    put(&h(t.bytes[1]));
+    put(b" lb=");
+    put(&[b'0' + (t.bytes[0] >> 7)]);
+    put(b" ");
+    for &v in &t.bytes {
+        put(&h(v));
+    }
+    put(b" e=");
+    put(&[b'0' + t.trellis_errs.min(9)]);
+    (b, n)
+}
+
 fn bump(i: usize) {
     SDR_STATS[i].fetch_add(1, Ordering::Relaxed);
 }
@@ -96,12 +131,24 @@ async fn stream(mut radio: Radio, mut vcp: Vcp, mut iq: UpChannel, mut cmd_rtt: 
     let (b0, b1) = (base, unsafe { base.add(DB_LEN) });
     let frames = unsafe { &mut *core::ptr::addr_of_mut!(FRAMES) };
     let (mut shift, mut rate, mut freq) = (4u32, DEFAULT_RATE_EXP, 868_000_000u32);
+    // 0: I/Q. Otherwise the P25 config with an MRSUBG raw tap: 1 hard bits, 2 freq detector,
+    // 3 soft symbols, 4 freq detector into the on-board TSBK decoder (text lines on the VCP).
+    let mut raw_mode = if cfg!(feature = "p25") { MODE_P25_DECODE } else { 0u8 };
+    let decoder = unsafe { &mut *core::ptr::addr_of_mut!(P25) };
     let (mut next, mut cur, mut seq) = (0usize, 0usize, 0u16);
     let mut rtt_cmd = CmdParser::new();
 
-    radio.set_rate_exp(rate);
-    radio.start_iq(b0, b1, DB_LEN as u16);
-    rprintln!("iq: started, Fs={} Hz", radio.sample_rate());
+    if raw_mode == MODE_P25_DECODE {
+        freq = option_env!("SWDR_P25_FREQ").and_then(|v| v.parse().ok()).unwrap_or(851_975_000);
+        radio.set_frequency(freq);
+        radio.configure_p25();
+        radio.start_raw(0b100, b0, unsafe { b0.add(PAYLOAD) }, PAYLOAD as u16);
+        rprintln!("p25: decoding at {} Hz", freq);
+    } else {
+        radio.set_rate_exp(rate);
+        radio.start_iq(b0, b1, DB_LEN as u16);
+        rprintln!("iq: started, Fs={} Hz", radio.sample_rate());
+    }
     report_tune(&radio, freq);
 
     loop {
@@ -115,13 +162,28 @@ async fn stream(mut radio: Radio, mut vcp: Vcp, mut iq: UpChannel, mut cmd_rtt: 
             bump(1);
         }
         for _ in 0..(pend & both).count_ones() {
-            let src = unsafe { core::slice::from_raw_parts(if next == 0 { b0 } else { b1 }, DB_LEN) };
+            let p25 = raw_mode != 0;
+            let half = if p25 { unsafe { b0.add(PAYLOAD) } } else { b1 };
+            let src = unsafe { core::slice::from_raw_parts(if next == 0 { b0 } else { half }, DB_LEN) };
             next ^= 1;
             bump(0);
             seq = seq.wrapping_add(1);
+            if raw_mode == MODE_P25_DECODE {
+                let samples = unsafe { core::slice::from_raw_parts(src.as_ptr() as *const i8, PAYLOAD) };
+                decoder.push(samples, &mut |t| {
+                    let (line, n) = tsbk_line(t);
+                    vcp.mark(core::str::from_utf8(&line[..n]).unwrap_or("?"));
+                });
+                continue;
+            }
             // frames[cur] is never the one the UART DMA is reading.
-            narrow(src, frames[cur].payload(), shift);
-            frames[cur].seal(seq, rate, shift as u8);
+            if p25 {
+                frames[cur].payload().copy_from_slice(&src[..PAYLOAD]);
+                frames[cur].seal(seq, TAG_RAW | raw_mode, 0);
+            } else {
+                narrow(src, frames[cur].payload(), shift);
+                frames[cur].seal(seq, rate, shift as u8);
+            }
             // NoBlockSkip writes whole frames or nothing, so the RTT stream stays frame-aligned.
             if iq.write(frames[cur].bytes()) == 0 {
                 bump(2);
@@ -151,11 +213,25 @@ async fn stream(mut radio: Radio, mut vcp: Vcp, mut iq: UpChannel, mut cmd_rtt: 
                     radio.set_rate_exp(rate);
                 }
                 3 => shift = arg.min(8),
+                4 => {
+                    raw_mode = (arg as u8).min(MODE_P25_DECODE);
+                    if raw_mode != 0 {
+                        radio.configure_p25();
+                    } else {
+                        radio.configure_iq(rate);
+                    }
+                }
                 _ => {}
             }
             PENDING.store(0, Ordering::Relaxed);
             next = 0;
-            radio.start_iq(b0, b1, DB_LEN as u16);
+            // Raw taps run at 1.2..15.6 kB/s, so use 1 KB buffers (one frame each) instead of 2 KB.
+            if raw_mode != 0 {
+                let rx_mode = [0, 0b001, 0b100, 0b101, 0b100][raw_mode as usize];
+                radio.start_raw(rx_mode, b0, unsafe { b0.add(PAYLOAD) }, PAYLOAD as u16);
+            } else {
+                radio.start_iq(b0, b1, DB_LEN as u16);
+            }
             rprintln!("cmd {} {} -> Fs={} shift={}", op, arg, radio.sample_rate(), shift);
             report_tune(&radio, freq);
         }

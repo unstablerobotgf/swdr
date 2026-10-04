@@ -99,10 +99,43 @@ impl Radio {
         (F_DIG as u32 / 8) >> e
     }
 
+    /// P25 Phase 1 C4FM demod in the IP: 4-FSK, 4800 sym/s, outer deviation 1800 Hz (inner = FDEV/3).
+    /// CONST_MAP 2 is 00:+F/3 01:+F 10:-F/3 11:-F, i.e. the P25 dibit mapping (RM0511 Table 110).
+    /// Register values from ST's MRSubG_SearchDatarateME / SearchFreqDevME (B=4).
+    pub fn configure_p25(&mut self) {
+        let (s, d) = (&self.p.static_, &self.p.dynamic_reg);
+        d.mod0_config().modify(|_, w| unsafe {
+            w.mod_type().bits(1).const_map().bits(2).bt_sel().clear_bit().datarate_m().bits(14995).datarate_e().bits(5)
+        });
+        // fdev M=157 E=0 = 1785 Hz; channel filter E=7 M=0 = 12.5 kHz, low-IF (300 kHz) path.
+        d.mod1_config().modify(|_, w| unsafe { w.fdev_m().bits(157).fdev_e().bits(0) });
+        // 4-level FSK: post-filter length 8 (value 0), as HAL_MRSubG_SetModulation does for 4FSK.
+        self.p.mr_subg.clkrec_ctrl0().modify(|_, w| w.pstflt_len().clear_bit());
+        s.pckt_ctrl().modify(|_, w| unsafe { w.whit_en().clear_bit().coding_sel().bits(0).four_fsk_sym_swap().clear_bit() });
+        self.set_rate_exp(7);
+    }
+
+    /// Undo configure_p25 for I/Q capture (only the channel filter matters there).
+    pub fn configure_iq(&mut self, rate_exp: u8) {
+        self.p.dynamic_reg.mod0_config().modify(|_, w| unsafe { w.mod_type().bits(0).const_map().bits(0) });
+        self.p.mr_subg.clkrec_ctrl0().modify(|_, w| w.pstflt_len().set_bit());
+        self.set_rate_exp(rate_exp);
+    }
+
+    /// Raw demod taps into the ping-pong buffers (RM0511 29.3.6): 0b001 hard bits,
+    /// 0b100 frequency-detector samples (i8 at the channel-filter rate), 0b101 soft symbols (i8 at symbol rate).
+    pub fn start_raw(&mut self, rx_mode: u8, buf0: *mut u8, buf1: *mut u8, len: u16) {
+        self.start_rx(rx_mode, buf0, buf1, len);
+    }
+
     /// Start continuous I/Q capture into two ping-pong buffers of `len` bytes (multiple of 4).
     pub fn start_iq(&mut self, buf0: *mut u8, buf1: *mut u8, len: u16) {
+        self.start_rx(0b011, buf0, buf1, len);
+    }
+
+    fn start_rx(&mut self, rx_mode: u8, buf0: *mut u8, buf1: *mut u8, len: u16) {
         let (s, d) = (&self.p.static_, &self.p.dynamic_reg);
-        s.pckt_ctrl().modify(|_, w| unsafe { w.rx_mode().bits(0b011) });
+        s.pckt_ctrl().modify(|_, w| unsafe { w.rx_mode().bits(rx_mode) });
         s.databuffer0_ptr().write(|w| unsafe { w.bits(buf0 as u32) });
         s.databuffer1_ptr().write(|w| unsafe { w.bits(buf1 as u32) });
         s.databuffer_size().write(|w| unsafe { w.bits(len as u32) });

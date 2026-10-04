@@ -26,4 +26,6 @@ debug = 2
 lto = "fat"
 codegen-units = 1
 
-
+[features]
+# Boot straight into on-board P25 TSBK decoding (frequency: SWDR_P25_FREQ at build time).
+p25 = []
