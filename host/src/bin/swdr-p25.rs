@@ -227,6 +227,11 @@ fn live(args: &[String]) -> Result<()> {
     if new {
         writeln!(out, "t,kind,tg,unit,ch")?;
     }
+    // Optional raw log: every line from the board, tab-prefixed with its receive time.
+    let mut raw = match opt(args, "--raw") {
+        Some(p) => Some(OpenOptions::new().create(true).append(true).open(&p).with_context(|| format!("opening {p}"))?),
+        None => None,
+    };
     let mut sp = serialport::new(&port, 2_000_000).timeout(Duration::from_millis(200)).open()?;
     eprintln!("reading {port}, appending events to {csv}, report every {every} s (Ctrl-C to stop)");
     let mut agg = Agg::default();
@@ -237,10 +242,14 @@ fn live(args: &[String]) -> Result<()> {
             while let Some(i) = pending.find('\n') {
                 let line: String = pending.drain(..=i).collect();
                 let line = line.trim();
+                let t = now();
+                if let Some(r) = raw.as_mut() {
+                    writeln!(r, "{t:.3}\t{line}")?;
+                }
                 if line.starts_with("ALERT") || line.starts_with("SUM t=") {
                     eprintln!("{line}");
                 }
-                for e in parse(line, now()) {
+                for e in parse(line, t) {
                     writeln!(out, "{}", e.csv())?;
                     agg.add(&e);
                 }
@@ -248,6 +257,9 @@ fn live(args: &[String]) -> Result<()> {
         }
         if last.elapsed() >= Duration::from_secs(every) {
             out.flush()?;
+            if let Some(r) = raw.as_mut() {
+                r.flush()?;
+            }
             println!("{}", agg.report(15));
             last = Instant::now();
         }

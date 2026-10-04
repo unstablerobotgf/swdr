@@ -159,7 +159,11 @@ cd host
 `live` timestamps the board's output, appends events to a CSV (`t,kind,tg,unit,ch`; kinds `talk`,
 `active`, `listen`, `on`, `off`) and prints a report: talkgroups by grants with distinct talkers and
 listeners, radios grouped by their primary talkgroup, and recent registrations. `report` replays a
-CSV through the same aggregator. Events come from group voice grants and updates, group affiliation
+CSV through the same aggregator. `--raw raw.log` also keeps every board line with its receive time.
+`tools/p25_report.py events.csv raw.log report.html` renders a local HTML report (talkgroup activity
+heatmap, voice carriers in use for receiver sizing, busiest talkgroups, site health, registrations,
+radio groupings); it contains IDs from the monitored system, so keep it local. `tools/verify_updates.py`
+cross-checks the board's per-window update counts against a raw log. Events come from group voice grants and updates, group affiliation
 and location registration responses, unit registration responses and deregistration acks.
 
 ## Wire protocol
