@@ -4,6 +4,7 @@
 mod p25;
 mod radio;
 mod rcc;
+mod tsbk;
 mod uart;
 
 use core::sync::atomic::Ordering;
@@ -93,34 +94,6 @@ fn narrow(src: &[u8], dst: &mut [u8], shift: u32) {
     }
 }
 
-/// "TSBK nac=00a op=3a mfid=00 lb=1 <12 bytes hex> e=2" for the VCP.
-fn tsbk_line(t: &p25::Tsbk) -> ([u8; 72], usize) {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut b = [0u8; 72];
-    let mut n = 0;
-    let mut put = |s: &[u8]| {
-        b[n..n + s.len()].copy_from_slice(s);
-        n += s.len();
-    };
-    let h = |v: u8| [HEX[(v >> 4) as usize], HEX[(v & 15) as usize]];
-    put(b"TSBK nac=");
-    put(&[HEX[(t.nac >> 8) as usize & 15]]);
-    put(&h(t.nac as u8));
-    put(b" op=");
-    put(&h(t.bytes[0] & 0x3F));
-    put(b" mfid=");
-    put(&h(t.bytes[1]));
-    put(b" lb=");
-    put(&[b'0' + (t.bytes[0] >> 7)]);
-    put(b" ");
-    for &v in &t.bytes {
-        put(&h(v));
-    }
-    put(b" e=");
-    put(&[b'0' + t.trellis_errs.min(9)]);
-    (b, n)
-}
-
 fn bump(i: usize) {
     SDR_STATS[i].fetch_add(1, Ordering::Relaxed);
 }
@@ -135,6 +108,7 @@ async fn stream(mut radio: Radio, mut vcp: Vcp, mut iq: UpChannel, mut cmd_rtt: 
     // 3 soft symbols, 4 freq detector into the on-board TSBK decoder (text lines on the VCP).
     let mut raw_mode = if cfg!(feature = "p25") { MODE_P25_DECODE } else { 0u8 };
     let decoder = unsafe { &mut *core::ptr::addr_of_mut!(P25) };
+    let mut idens = tsbk::Idens::new();
     let (mut next, mut cur, mut seq) = (0usize, 0usize, 0u16);
     let mut rtt_cmd = CmdParser::new();
 
@@ -171,8 +145,8 @@ async fn stream(mut radio: Radio, mut vcp: Vcp, mut iq: UpChannel, mut cmd_rtt: 
             if raw_mode == MODE_P25_DECODE {
                 let samples = unsafe { core::slice::from_raw_parts(src.as_ptr() as *const i8, PAYLOAD) };
                 decoder.push(samples, &mut |t| {
-                    let (line, n) = tsbk_line(t);
-                    vcp.mark(core::str::from_utf8(&line[..n]).unwrap_or("?"));
+                    let line = tsbk::format(t.nac, &t.bytes, t.trellis_errs, &mut idens);
+                    vcp.mark(core::str::from_utf8(&line.buf[..line.len]).unwrap_or("?"));
                 });
                 continue;
             }

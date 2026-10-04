@@ -3,6 +3,8 @@
 #[path = "../../firmware/src/p25.rs"]
 #[allow(dead_code)]
 mod p25;
+#[path = "../../firmware/src/tsbk.rs"]
+mod tsbk;
 
 fn main() -> anyhow::Result<()> {
     let path = std::env::args().nth(1).unwrap_or("capture_freq.bin".into());
@@ -14,8 +16,16 @@ fn main() -> anyhow::Result<()> {
         dec.push(chunk, &mut |t| out.push((t.nac, t.bytes, t.trellis_errs)));
     }
     println!("{} CRC-valid TSBKs from {} frame syncs in {:.1} s", out.len(), dec.frames_seen, samples.len() as f64 / 15625.0);
-    for (nac, b, e) in out.iter().take(6) {
-        println!("  nac={nac:03x} op={:02x} {} e={e}", b[0] & 0x3f, b.iter().map(|x| format!("{x:02x}")).collect::<String>());
+    let mut idens = tsbk::Idens::new();
+    let mut seen = std::collections::BTreeMap::new();
+    for (nac, b, e) in &out {
+        let l = tsbk::format(*nac, b, *e, &mut idens);
+        let text = String::from_utf8_lossy(&l.buf[..l.len]).to_string();
+        let name = text.split_whitespace().nth(1).unwrap_or("").to_string();
+        seen.entry(name).or_insert(text);
+    }
+    for (_, line) in seen {
+        println!("  {line}");
     }
     Ok(())
 }

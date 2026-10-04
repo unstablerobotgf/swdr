@@ -92,15 +92,22 @@ cd firmware
 SWDR_P25_FREQ=851975000 cargo run --release --features p25   # boots straight into decoding
 ```
 
-Output, one line per CRC-valid TSBK (VCP, 2 Mbaud 8N1):
+Output, one line per CRC-valid TSBK (VCP, 2 Mbaud 8N1). Values below are illustrative:
 
 ```
-TSBK nac=00a op=3a mfid=00 lb=1 ba000a300a0a0a009b70f8e1 e=1
+nac=123 RFSS_STATUS_BCAST lra=01 sys=123 rfss=1 site=2 ch=0-155(851.975000MHz) [...] e=0
+nac=123 GRP_VCH_GRANT tg=1001 src=2000001 ch=8-419(852.312500MHz) [...] e=1
+nac=123 IDEN_UPDATE id=0 base=851.006250MHz step=6250Hz tx_off=-45000kHz [...] e=0
+nac=123 VENDOR mfid=90 op=02 [...] e=0
 ```
 
-`nac` is the network access code, `op` the TSBK opcode, `lb` the last-block flag, then the 12 raw
-TSBK bytes (CRC included) and the number of bit errors the trellis decoder corrected. Without the
-`p25` feature, mode command `op 4 = 4` switches a running board into the decoder.
+Each line has the NAC, the opcode name, decoded fields for common outbound messages (grants,
+affiliation and registration responses, identifier updates, RFSS/network/adjacent status, secondary
+control channels, system services), the raw 12 TSBK bytes, and the number of bit errors the trellis
+decoder corrected. Channel IDs are `iden-channel`; the frequency is shown once the matching
+IDEN_UPDATE (0x3D, 0x34 or 0x33) has been received. Opcode names follow SDRTrunk; field positions
+follow OP25 `tk_p25.py`. Vendor (non-zero MFID) messages are printed raw. Without the `p25` feature,
+mode command `op 4 = 4` switches a running board into the decoder.
 
 Signal path:
 
