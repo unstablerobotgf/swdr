@@ -15,10 +15,10 @@ fn main() -> anyhow::Result<()> {
     }
     let lines: Vec<&str> = text.lines().map(str::trim).filter(|l| !l.is_empty()).collect();
     let tsbk: Vec<&&str> = lines.iter().filter(|l| l.starts_with("nac=")).collect();
-    for l in lines.iter().filter(|l| !l.starts_with("nac=")).take(10) {
-        println!("other: {l}");
+    for l in lines.iter().filter(|l| l.starts_with("SUM") || l.starts_with("ALERT")) {
+        println!("{l}");
     }
-    for l in tsbk.iter().filter(|l| l.contains("MHz")).take(8) {
+    for l in tsbk.iter().filter(|l| l.contains("MHz")).take(2) {
         println!("{l}");
     }
     println!("{} TSBK lines in {secs} s ({:.1}/s)", tsbk.len(), tsbk.len() as f64 / secs as f64);

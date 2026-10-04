@@ -1,6 +1,7 @@
 #![no_std]
 #![no_main]
 
+mod activity;
 mod bch;
 mod p25;
 mod radio;
@@ -32,6 +33,9 @@ struct DbBuf([u8; 2 * DB_LEN]);
 static mut DB: DbBuf = DbBuf([0; 2 * DB_LEN]);
 static mut FRAMES: [Frame; 2] = [Frame::new(), Frame::new()];
 static mut P25: p25::Decoder = p25::Decoder::new();
+static mut ACTIVITY: activity::Activity = activity::Activity::new();
+/// 100 Hz ticks since boot (SysTick).
+static TICKS: AtomicU32 = AtomicU32::new(0);
 
 /// Raw-tap mode that runs the on-board P25 TSBK decoder instead of streaming frames.
 const MODE_P25_DECODE: u8 = 4;
@@ -84,6 +88,7 @@ extern "C" fn MR_SUBG() {
 /// 100 Hz heartbeat: commands must be serviced even when the radio has stopped (e.g. no PLL lock).
 #[cortex_m_rt::exception]
 fn SysTick() {
+    TICKS.fetch_add(1, Ordering::Relaxed);
     WAKE.signal(());
 }
 
@@ -110,6 +115,7 @@ async fn stream(mut radio: Radio, mut vcp: Vcp, mut iq: UpChannel, mut cmd_rtt: 
     let mut raw_mode = if cfg!(feature = "p25") { MODE_P25_DECODE } else { 0u8 };
     let decoder = unsafe { &mut *core::ptr::addr_of_mut!(P25) };
     let mut idens = tsbk::Idens::new();
+    let act = unsafe { &mut *core::ptr::addr_of_mut!(ACTIVITY) };
     let (mut next, mut cur, mut seq) = (0usize, 0usize, 0u16);
     let mut rtt_cmd = CmdParser::new();
 
@@ -145,7 +151,9 @@ async fn stream(mut radio: Radio, mut vcp: Vcp, mut iq: UpChannel, mut cmd_rtt: 
             seq = seq.wrapping_add(1);
             if raw_mode == MODE_P25_DECODE {
                 let samples = unsafe { core::slice::from_raw_parts(src.as_ptr() as *const i8, PAYLOAD) };
+                let now_s = TICKS.load(Ordering::Relaxed) / 100;
                 decoder.push(samples, &mut |t| {
+                    act.on_tsbk(&t.bytes, t.trellis_errs, t.nid_errs, now_s);
                     let line = tsbk::format(t.nac, &t.bytes, t.trellis_errs, t.nid_errs, &mut idens);
                     vcp.mark(core::str::from_utf8(&line.buf[..line.len]).unwrap_or("?"));
                 });
@@ -171,10 +179,22 @@ async fn stream(mut radio: Radio, mut vcp: Vcp, mut iq: UpChannel, mut cmd_rtt: 
             }
         }
 
+        if raw_mode == MODE_P25_DECODE {
+            let now_s = TICKS.load(Ordering::Relaxed) / 100;
+            act.poll(now_s, decoder.frames_seen, decoder.nid_rejects, &mut |l| {
+                vcp.mark(core::str::from_utf8(&l.buf[..l.len]).unwrap_or("?"))
+            });
+        }
+
         let mut cmd = vcp.poll_cmd();
         let mut b = [0u8; 1];
         while cmd.is_none() && cmd_rtt.read(&mut b) == 1 {
             cmd = rtt_cmd.feed(b[0]);
+        }
+        // op 5 = summary interval (s, 0 = off); it does not touch the radio.
+        if let Some((5, arg)) = cmd {
+            act.interval_s = arg;
+            cmd = None;
         }
         if let Some((op, arg)) = cmd {
             radio.abort();
@@ -221,10 +241,22 @@ async fn main(spawner: Spawner) {
     // ROM bootloader jumps to us with PRIMASK=1; ST's SystemInit ends with __enable_irq().
     unsafe { cortex_m::interrupt::enable() };
 
+    // The standalone P25 build streams over the VCP, so the RTT I/Q ring shrinks to free RAM.
+    #[cfg(not(feature = "p25"))]
     let ch = rtt_init! {
         up: {
             0: { size: 512, mode: ChannelMode::NoBlockSkip, name: "log" }
             1: { size: 16384, mode: ChannelMode::NoBlockSkip, name: "iq" }
+        }
+        down: {
+            0: { size: 64, name: "cmd" }
+        }
+    };
+    #[cfg(feature = "p25")]
+    let ch = rtt_init! {
+        up: {
+            0: { size: 512, mode: ChannelMode::NoBlockSkip, name: "log" }
+            1: { size: 1024, mode: ChannelMode::NoBlockSkip, name: "iq" }
         }
         down: {
             0: { size: 64, name: "cmd" }

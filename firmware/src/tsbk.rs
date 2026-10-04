@@ -57,6 +57,10 @@ impl Write for Line {
 }
 
 /// Field `width` bits wide whose LSB is `shift` bits up from the end of the 96-bit TSBK (OP25 numbering).
+pub fn field(b: &[u8; 12], shift: u32, width: u32) -> u32 {
+    f(b, shift, width)
+}
+
 fn f(b: &[u8; 12], shift: u32, width: u32) -> u32 {
     let mut v: u128 = 0;
     for &x in b {
