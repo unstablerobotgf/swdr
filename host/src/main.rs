@@ -37,7 +37,7 @@ fn args() -> Args {
             "--listen" => a.listen = it.next().unwrap_or_default(),
             "--port" => a.port = it.next().unwrap_or_default(),
             "--yaml" => a.yaml = it.next().unwrap_or_default(),
-            _ => panic!("usage: wl3x-sdr-host [--swd [--yaml target.yaml] | --port COMx] [--listen addr:port]"),
+            _ => panic!("usage: swdr [--swd [--yaml target.yaml] | --port COMx] [--listen addr:port]"),
         }
     }
     a

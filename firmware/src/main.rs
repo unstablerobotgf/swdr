@@ -186,7 +186,7 @@ async fn main(spawner: Spawner) {
     // Brief pause so a host can (re)open the VCP after a cold boot; core runs 16 MHz here.
     cortex_m::asm::delay(16_000_000);
     vcp.mark("");
-    vcp.mark("wl3x-sdr boot");
+    vcp.mark("swdr boot");
     rcc::init(&p, |m| vcp.mark(m));
 
     let mut cp = unsafe { cortex_m::Peripherals::steal() };

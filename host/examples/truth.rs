@@ -2,7 +2,7 @@
 use probe_rs::{config::Registry, probe::list::Lister, MemoryInterface, Permissions};
 
 fn main() -> anyhow::Result<()> {
-    let elf = std::fs::read("../firmware/target/thumbv6m-none-eabi/release/wl3x-sdr-fw")?;
+    let elf = std::fs::read("../firmware/target/thumbv6m-none-eabi/release/swdr-fw")?;
     let mut reg = Registry::from_builtin_families();
     reg.add_target_family_from_yaml(&std::fs::read_to_string("../probe/STM32WL3_Series.yaml")?)?;
     let mut s = loop {

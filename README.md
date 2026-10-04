@@ -1,6 +1,6 @@
-# wl3x-sdr
+# swdr
 
-An rtl_tcp-compatible SDR built on the STM32WL33's sub-GHz radio (MRSUBG), streaming I/Q to a PC
+An rtl_tcp-compatible SDR that streams I/Q over SWD from the STM32WL33's sub-GHz radio (MRSUBG)
 through the on-board STLINK-V3EC of a NUCLEO-WL33CC1. Inspired by [esp-sdr](https://github.com/ESPARGOS/esp-sdr).
 Firmware is Rust on embassy-executor. SDR++, GQRX, gr-osmosdr and other rtl_tcp clients can connect.
 
@@ -15,7 +15,7 @@ Firmware is Rust on embassy-executor. SDR++, GQRX, gr-osmosdr and other rtl_tcp 
 
 - **JP2 (IDD jumper) must be fitted.** Without it the MCU is fed through its I/O protection
   diodes and browns out as soon as the radio starts: reboot loops, flaky SWD, zero-filled debug
-  reads. This one jumper caused most of the debugging pain in this project's history.
+  reads.
 - JP1 on 5V_STLK, SW1 in the default 3V3 position, JP4 not fitted (embedded STLINK).
 - The STM32WL3x has no USB peripheral; everything goes through the STLINK-V3EC (USB high-speed).
 
@@ -24,7 +24,7 @@ Firmware is Rust on embassy-executor. SDR++, GQRX, gr-osmosdr and other rtl_tcp 
 | Path | What |
 |:--|:--|
 | `firmware/` | embassy firmware: clocks, MRSUBG I/Q capture, RTT + VCP transports |
-| `host/` | `wl3x-sdr-host` rtl_tcp bridge, plus test tools in `examples/` |
+| `host/` | `swdr` rtl_tcp bridge, plus test tools in `examples/` |
 | `pac/stm32wl33-pac/` | svd2rust PAC from ST's SVD (`regen.sh` regenerates; patches `nvicPrioBits` 4 to 2) |
 | `probe/` | probe-rs target YAML (see `probe/README.md` for the flash-algorithm relocation) |
 | `patches/` | probe-rs 0.32.0 patch adding an STM32WL3x debug sequence |
@@ -46,8 +46,8 @@ ST-Link driver replays it on WAIT, re-triggering the reset. The patch tolerates 
 ```sh
 cd firmware && cargo run --release        # flash + RTT log via the patched probe-rs
 cd host && cargo build --release
-./target/release/wl3x-sdr-host --swd      # rtl_tcp on 127.0.0.1:1234, I/Q over SWD/RTT
-./target/release/wl3x-sdr-host --port COM11   # fallback over the VCP (62.5 kS/s max)
+./target/release/swdr --swd      # rtl_tcp on 127.0.0.1:1234, I/Q over SWD/RTT
+./target/release/swdr --port COM11   # fallback over the VCP (62.5 kS/s max)
 ```
 
 Point an rtl_tcp client at `127.0.0.1:1234`, sample rate 250000. Gain steps select which 8 bits of
