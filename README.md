@@ -104,7 +104,7 @@ nac=123 VENDOR mfid=90 op=02 [...] e=0
 Each line has the NAC, the opcode name, decoded fields for common outbound messages (grants,
 affiliation and registration responses, identifier updates, RFSS/network/adjacent status, secondary
 control channels, system services), the raw 12 TSBK bytes, and the number of bit errors the trellis
-decoder corrected. Channel IDs are `iden-channel`; the frequency is shown once the matching
+decoder corrected (`e`) and NID bits corrected by BCH (`nid_e`). Channel IDs are `iden-channel`; the frequency is shown once the matching
 IDEN_UPDATE (0x3D, 0x34 or 0x33) has been received. Opcode names follow SDRTrunk; field positions
 follow OP25 `tk_p25.py`. Vendor (non-zero MFID) messages are printed raw. Without the `p25` feature,
 mode command `op 4 = 4` switches a running board into the decoder.
@@ -116,14 +116,21 @@ Signal path:
 - The radio's frequency-detector tap (`RX_MODE=100`, i8 at 15625 S/s) feeds `firmware/src/p25.rs`:
   a 16-phase integrate-and-dump symbol bank sharing one boundary grid, frame sync on symbol signs,
   a per-frame least-squares fit on the 24 sync symbols for DC and scale, status-symbol removal,
-  deinterleave, hard-decision Viterbi and CRC-16/GSM.
+  BCH(63,16,23) correction of the NID (up to 11 bit errors; frames with an uncorrectable NID are
+  dropped), deinterleave, hard-decision Viterbi and CRC-16/GSM.
 - The radio's own hard-decision 4-FSK output (`RX_MODE=001`) also works, but recovered about 60% of
   TSBKs against a continuous control channel, so it is not used.
 
 Validation (`tools/p25_ref.py` decodes captured I/Q; `host/examples/p25_offline.rs` runs `p25.rs`
 on a captured frequency-detector tap): on a 20 s capture of a live control channel, the I/Q
 reference decoded 530 TSBKs and `p25.rs` decoded 532 from 533 frame syncs, all with 0 trellis
-errors. Live on hardware: about 30 TSBKs/s.
+errors. Live on hardware: about 27 TSBKs/s.
+
+NID BCH: `tools/bch.py` is the reference (checks the generator's roots and decodes random words
+with up to 11 errors); `p25_offline` self-tests `bch.rs` the same way. All 532 NIDs from CRC-valid
+frames in a live capture re-encode exactly from their 16 info bits. With Gaussian noise added to that
+capture (sd 12 counts), 389 of 399 decoded TSBKs came from frames whose NID needed correction (up to
+10 bits).
 
 ## Wire protocol
 

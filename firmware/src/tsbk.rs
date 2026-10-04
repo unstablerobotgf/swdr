@@ -73,7 +73,7 @@ fn ch(line: &mut Line, idens: &Idens, key: &str, id: u32) {
 }
 
 /// Decode one TSBK into `line`, learning identifier tables along the way.
-pub fn format(nac: u16, b: &[u8; 12], trellis_errs: u8, idens: &mut Idens) -> Line {
+pub fn format(nac: u16, b: &[u8; 12], trellis_errs: u8, nid_errs: u8, idens: &mut Idens) -> Line {
     let mut l = Line { buf: [0; 192], len: 0 };
     let (op, mfid) = (b[0] & 0x3F, b[1]);
     let _ = write!(l, "nac={nac:03x} ");
@@ -169,6 +169,6 @@ pub fn format(nac: u16, b: &[u8; 12], trellis_errs: u8, idens: &mut Idens) -> Li
     for x in b {
         let _ = write!(l, "{x:02x}");
     }
-    let _ = write!(l, "] e={trellis_errs}");
+    let _ = write!(l, "] e={trellis_errs} nid_e={nid_errs}");
     l
 }

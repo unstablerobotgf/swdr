@@ -1,6 +1,7 @@
 #![no_std]
 #![no_main]
 
+mod bch;
 mod p25;
 mod radio;
 mod rcc;
@@ -145,7 +146,7 @@ async fn stream(mut radio: Radio, mut vcp: Vcp, mut iq: UpChannel, mut cmd_rtt: 
             if raw_mode == MODE_P25_DECODE {
                 let samples = unsafe { core::slice::from_raw_parts(src.as_ptr() as *const i8, PAYLOAD) };
                 decoder.push(samples, &mut |t| {
-                    let line = tsbk::format(t.nac, &t.bytes, t.trellis_errs, &mut idens);
+                    let line = tsbk::format(t.nac, &t.bytes, t.trellis_errs, t.nid_errs, &mut idens);
                     vcp.mark(core::str::from_utf8(&line.buf[..line.len]).unwrap_or("?"));
                 });
                 continue;

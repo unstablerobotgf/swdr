@@ -32,6 +32,8 @@ pub struct Tsbk {
     pub nac: u16,
     pub bytes: [u8; 12],
     pub trellis_errs: u8,
+    /// NID bits corrected by BCH(63,16).
+    pub nid_errs: u8,
 }
 
 #[derive(Clone, Copy)]
@@ -59,6 +61,7 @@ pub struct Decoder {
     len: usize,
     blocks_done: usize,
     pub frames_seen: u32,
+    pub nid_rejects: u32,
 }
 
 impl Decoder {
@@ -78,6 +81,7 @@ impl Decoder {
             len: 0,
             blocks_done: 0,
             frames_seen: 0,
+            nid_rejects: 0,
         }
     }
 
@@ -179,14 +183,21 @@ impl Decoder {
         for &d in &dib[24..56] {
             nid = (nid << 2) | d as u64;
         }
-        let (nac, duid) = (((nid >> 52) & 0xFFF) as u16, ((nid >> 48) & 0xF) as u8);
+        // 63-bit BCH codeword plus one overall parity bit (ignored). Uncorrectable: drop the frame.
+        let Some((info, nid_errs)) = crate::bch::decode(nid >> 1) else {
+            self.nid_rejects = self.nid_rejects.wrapping_add(1);
+            self.lock = None;
+            self.len = 0;
+            return;
+        };
+        let (nac, duid) = (info >> 4, (info & 0xF) as u8);
         let k = self.blocks_done;
         let mut more = false;
         if duid == 0x7 {
             let blk: &[u8; 98] = dib[56 + 98 * k..56 + 98 * (k + 1)].try_into().unwrap();
             let (bytes, errs) = decode_block(blk);
             if crc16_gsm(&bytes[..10]) == u16::from_be_bytes([bytes[10], bytes[11]]) {
-                emit(&Tsbk { nac, bytes, trellis_errs: errs });
+                emit(&Tsbk { nac, bytes, trellis_errs: errs, nid_errs });
                 more = bytes[0] & 0x80 == 0 && k < 2;
             }
         }
