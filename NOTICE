@@ -1,0 +1,10 @@
+wl3x-sdr
+Copyright 2026 Taylor
+
+This project includes material derived from STMicroelectronics' STM32WL3x DFP
+(Keil.STM32WL3x_DFP 1.2.0), Copyright (c) 2024 STMicroelectronics, Apache-2.0:
+- pac/stm32wl33-pac/STM32WL33.svd and the PAC generated from it
+- probe/STM32WL3_Series*.yaml (target-gen output, embeds the STM32WL3x flash algorithm)
+
+Register sequences in firmware/src/rcc.rs and firmware/src/radio.rs are transcribed from
+STMicroelectronics' STM32CubeWL3 HAL (BSD-3-Clause).

@@ -1,0 +1,8 @@
+target/
+.tools/
+third_party/
+vendor-docs/
+*.u8
+*.log
+*.elf
+__pycache__/

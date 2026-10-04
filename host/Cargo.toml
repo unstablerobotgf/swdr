@@ -1,0 +1,12 @@
+[package]
+name = "wl3x-sdr-host"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "rtl_tcp server streaming I/Q from an STM32WL3x over SWD/RTT"
+
+[dependencies]
+probe-rs = { path = "../third_party/probe-rs/probe-rs" }  # patched: tools/setup-probe-rs.sh
+anyhow = "1"
+serialport = "4"
+ctrlc = "3"

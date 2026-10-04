@@ -1,0 +1,15 @@
+[package]
+name = "stm32wl33-pac"
+version = "0.1.0"
+edition = "2021"
+description = "svd2rust PAC for STM32WL33, generated from ST's STM32WL3x_DFP 1.2.0 SVD"
+license = "Apache-2.0"
+
+[dependencies]
+cortex-m = "0.7"
+cortex-m-rt = { version = "0.7", optional = true }
+vcell = "0.1"
+critical-section = { version = "1", optional = true }
+
+[features]
+rt = ["cortex-m-rt/device"]

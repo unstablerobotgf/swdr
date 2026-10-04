@@ -1,0 +1,6 @@
+[build]
+target = "thumbv6m-none-eabi"
+
+[target.thumbv6m-none-eabi]
+runner = "../.tools/bin/probe-rs run --chip-description-path ../probe/STM32WL3_Series.yaml --chip STM32WL33CCVx --speed 24000"
+rustflags = ["-C", "link-arg=-Tlink.x"]

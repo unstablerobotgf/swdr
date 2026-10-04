@@ -1,0 +1,104 @@
+diff --git a/probe-rs/src/vendor/st/mod.rs b/probe-rs/src/vendor/st/mod.rs
+index af70474..cda41c4 100644
+--- a/probe-rs/src/vendor/st/mod.rs
++++ b/probe-rs/src/vendor/st/mod.rs
+@@ -12,6 +12,7 @@ use crate::{
+             stm32_armv8::Stm32Armv8,
+             stm32h7::{Stm32h7, Stm32h7Line},
+             stm32n6::Stm32n6,
++            stm32wl3::Stm32Wl3,
+         },
+     },
+ };
+@@ -24,7 +25,9 @@ pub struct St;
+ 
+ impl Vendor for St {
+     fn try_create_debug_sequence(&self, chip: &Chip) -> Option<DebugSequence> {
+-        let sequence = if chip.name.starts_with("STM32F0") {
++        let sequence = if chip.name.starts_with("STM32WL3") {
++            DebugSequence::Arm(Stm32Wl3::create())
++        } else if chip.name.starts_with("STM32F0") {
+             DebugSequence::Arm(Stm32Armv6::create(Stm32Armv6Family::F0))
+         } else if chip.name.starts_with("STM32L0") {
+             DebugSequence::Arm(Stm32Armv6::create(Stm32Armv6Family::L0))
+diff --git a/probe-rs/src/vendor/st/sequences/mod.rs b/probe-rs/src/vendor/st/sequences/mod.rs
+index e4bdf7e..a2eb2e1 100644
+--- a/probe-rs/src/vendor/st/sequences/mod.rs
++++ b/probe-rs/src/vendor/st/sequences/mod.rs
+@@ -5,3 +5,4 @@ pub mod stm32_armv7;
+ pub mod stm32_armv8;
+ pub mod stm32h7;
+ pub mod stm32n6;
++pub mod stm32wl3;
+diff --git a/probe-rs/src/vendor/st/sequences/stm32wl3.rs b/probe-rs/src/vendor/st/sequences/stm32wl3.rs
+new file mode 100644
+index 0000000..8ff72c4
+--- /dev/null
++++ b/probe-rs/src/vendor/st/sequences/stm32wl3.rs
+@@ -0,0 +1,66 @@
++//! Sequences for STM32WL3x (Cortex-M0+, BlueNRG-LP-derived system controller).
++
++use std::sync::Arc;
++
++use probe_rs_target::CoreType;
++
++use crate::core::memory_mapped_registers::MemoryMappedRegister;
++
++use crate::architecture::arm::{
++    ArmDebugInterface, ArmError, FullyQualifiedApAddress,
++    core::armv7m::Aircr,
++    memory::ArmMemoryInterface,
++    sequences::{ArmDebugSequence, cortex_m_wait_for_reset},
++};
++
++/// RCC_APB0ENR; bit 15 is DBGMCUEN, reset value 0 (RM0511 6.6.13).
++const RCC_APB0ENR: u64 = 0x4840_0054;
++const DBGMCUEN: u32 = 1 << 15;
++/// DBG_CR; POR-reset only. DBG_SLEEP = bit 0, DBG_STOP = bit 1 (RM0511 30.3.1).
++const DBG_CR: u64 = 0x4000_8000;
++
++/// Marker structure for STM32WL3x devices.
++#[derive(Debug)]
++pub struct Stm32Wl3 {}
++
++impl Stm32Wl3 {
++    /// Create the sequencer for STM32WL3x devices.
++    pub fn create() -> Arc<Self> {
++        Arc::new(Self {})
++    }
++}
++
++impl ArmDebugSequence for Stm32Wl3 {
++    fn debug_device_unlock(
++        &self,
++        interface: &mut dyn ArmDebugInterface,
++        default_ap: &FullyQualifiedApAddress,
++        _permissions: &crate::Permissions,
++    ) -> Result<(), ArmError> {
++        // With DBG_CR = 0 a WFI/WFE gates the debug clocks and SWD stops responding.
++        let mut memory = interface.memory_interface(default_ap)?;
++        let enr = memory.read_word_32(RCC_APB0ENR)?;
++        memory.write_word_32(RCC_APB0ENR, enr | DBGMCUEN)?;
++        memory.write_word_32(DBG_CR, 0b11)?;
++        Ok(())
++    }
++
++    fn reset_system(
++        &self,
++        interface: &mut dyn ArmMemoryInterface,
++        _core_type: CoreType,
++        _debug_base: Option<u64>,
++    ) -> Result<(), ArmError> {
++        let mut aircr = Aircr(0);
++        aircr.vectkey();
++        aircr.set_sysresetreq(true);
++
++        // The AIRCR write is never ACKed: the AP answers WAIT, and probes that replay
++        // the write on WAIT (ST-Link) keep re-triggering the reset. Treat it as done.
++        if let Err(e) = interface.write_word_32(Aircr::get_mmio_address(), aircr.into()) {
++            tracing::debug!("STM32WL3x: AIRCR write not acknowledged ({e}), assuming reset");
++        }
++
++        cortex_m_wait_for_reset(interface)
++    }
++}

@@ -1,0 +1,29 @@
+[package]
+name = "wl3x-sdr-fw"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+
+[dependencies]
+stm32wl33-pac = { path = "../pac/stm32wl33-pac", features = ["rt"] }
+cortex-m = { version = "0.7.7", features = ["critical-section-single-core", "inline-asm"] }
+# set-vtor: ROM bootloader leaves VTOR=0; ST SystemInit sets it, cortex-m-rt does not by default.
+cortex-m-rt = { version = "0.7.5", features = ["set-vtor"] }
+embassy-executor = { version = "0.10", features = ["platform-cortex-m", "executor-thread"] }
+embassy-sync = "0.8"
+rtt-target = "0.6"
+panic-rtt-target = "0.2"
+critical-section = "1.2"
+portable-atomic = { version = "1", features = ["critical-section"] }
+
+[profile.dev]
+opt-level = "s"
+debug = 2
+
+[profile.release]
+opt-level = 3
+debug = 2
+lto = "fat"
+codegen-units = 1
+
+
