@@ -108,6 +108,9 @@ pub fn format(nac: u16, b: &[u8; 12], trellis_errs: u8, nid_errs: u8, idens: &mu
             0x28 => {
                 let _ = write!(l, " result={} tg={} unit={}", f(b, 72, 2), f(b, 40, 16), f(b, 16, 24));
             }
+            0x2B => {
+                let _ = write!(l, " result={} tg={} unit={}", f(b, 72, 2), f(b, 56, 16), f(b, 16, 24));
+            }
             0x2C => {
                 let _ = write!(l, " result={} sys={:03x} src={}", f(b, 76, 2), f(b, 64, 12), f(b, 16, 24));
             }

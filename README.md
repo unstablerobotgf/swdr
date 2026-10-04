@@ -132,12 +132,42 @@ frames in a live capture re-encode exactly from their 16 info bits. With Gaussia
 capture (sd 12 counts), 389 of 399 decoded TSBKs came from frames whose NID needed correction (up to
 10 bits).
 
+## Activity summaries and aggregation
+
+On the board (`p25` build), `firmware/src/activity.rs` keeps bounded per-talkgroup aggregates and
+prints them every 30 s (`op 5` sets the interval in seconds, 0 turns it off). Values below are
+illustrative:
+
+```
+SUM t=60s window=30s tsbk=800 (26.6/s) frames=1599 nid_fixed=2 nid_rej=0 trellis_e=3 vendor=0 sys=123 rfss=1 site=2 cc=0-155
+SUM tg=1001 grants=5 updates=40 total=7 last=17s ago baseline=2.0/window
+ALERT tg=1001 grants=12 in 30s vs baseline 1.0/window
+```
+
+`SUM t=` is site health (TSBK rate, NID corrections and rejects, trellis corrections, site identity).
+`SUM tg=` lists the busiest talkgroups of the window. `ALERT` fires when a talkgroup's new grants
+reach 4x its EWMA baseline + 2 (minimum 3) once it has 4 windows of history.
+
+On a PC, `swdr-p25` aggregates everything, including per-radio views:
+
+```sh
+cd host
+./target/release/swdr-p25 live --port COM11 --csv events.csv --every 60
+./target/release/swdr-p25 report events.csv
+```
+
+`live` timestamps the board's output, appends events to a CSV (`t,kind,tg,unit,ch`; kinds `talk`,
+`active`, `listen`, `on`, `off`) and prints a report: talkgroups by grants with distinct talkers and
+listeners, radios grouped by their primary talkgroup, and recent registrations. `report` replays a
+CSV through the same aggregator. Events come from group voice grants and updates, group affiliation
+and location registration responses, unit registration responses and deregistration acks.
+
 ## Wire protocol
 
 - Frames (RTT up-channel 1 and VCP): `A5 5A seq:u16 len:u16 rate_exp:u8 shift:u8` then 1024 B of
   u8 I/Q (offset binary, rtl_sdr format). Fs = 2 MHz >> rate_exp.
 - Commands (RTT down-channel 0 or VCP RX): `C5 op arg:u32` little-endian. op 1 = frequency in Hz,
-  2 = rate exponent, 3 = shift, 4 = mode (0 I/Q; 1 hard bits, 2 frequency detector, 3 soft symbols as
+  2 = rate exponent, 3 = shift, 5 = summary interval in seconds, 4 = mode (0 I/Q; 1 hard bits, 2 frequency detector, 3 soft symbols as
   raw frames tagged `0xF0 | RX_MODE`; 4 on-board P25 decoder).
 
 ## STM32WL3x findings worth knowing
