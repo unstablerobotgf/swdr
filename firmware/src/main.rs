@@ -246,7 +246,8 @@ async fn main(spawner: Spawner) {
     let ch = rtt_init! {
         up: {
             0: { size: 512, mode: ChannelMode::NoBlockSkip, name: "log" }
-            1: { size: 16384, mode: ChannelMode::NoBlockSkip, name: "iq" }
+            // 12 KB, not 16: P25 + ACTIVITY statics left a 2 KB stack, which overflowed into .bss.
+            1: { size: 12288, mode: ChannelMode::NoBlockSkip, name: "iq" }
         }
         down: {
             0: { size: 64, name: "cmd" }
