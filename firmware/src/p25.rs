@@ -62,6 +62,8 @@ pub struct Decoder {
     blocks_done: usize,
     /// Running mean of symbol values (carrier offset). Sync signs are taken against it, not 0.
     dc: i32,
+    /// Sums of per-frame sync fits (dc, a, count) since the host last took them; drives software AFC.
+    pub fit_sums: (i32, i32, u32),
     pub frames_seen: u32,
     pub nid_rejects: u32,
 }
@@ -83,6 +85,7 @@ impl Decoder {
             len: 0,
             blocks_done: 0,
             dc: 0,
+            fit_sums: (0, 0, 0),
             frames_seen: 0,
             nid_rejects: 0,
         }
@@ -153,6 +156,7 @@ impl Decoder {
                     self.len += 1;
                 }
                 self.lock = Some((bp, a, dc));
+                self.fit_sums = (self.fit_sums.0.saturating_add(dc), self.fit_sums.1.saturating_add(a), self.fit_sums.2 + 1);
                 self.blocks_done = 0;
                 self.frames_seen = self.frames_seen.wrapping_add(1);
             }

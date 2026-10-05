@@ -31,7 +31,8 @@ impl Frame {
     }
 }
 
-/// Host commands on any transport: C5 op arg:u32 LE. Ops: 1 freq Hz, 2 rate exponent, 3 shift.
+/// Host commands on any transport: C5 op arg:u32 LE. Ops: 1 freq Hz, 2 rate exponent, 3 shift,
+/// 4 mode, 5 summary interval s, 6 MR_SUBG write (offset << 16 | value), 7 MR_SUBG read (offset), 8 software AFC on/off.
 pub struct CmdParser {
     buf: [u8; 6],
     n: usize,

@@ -9,6 +9,7 @@ mod rcc;
 mod tsbk;
 mod uart;
 
+use core::fmt::Write;
 use core::sync::atomic::Ordering;
 use embassy_executor::Spawner;
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
@@ -118,6 +119,10 @@ async fn stream(mut radio: Radio, mut vcp: Vcp, mut iq: UpChannel, mut cmd_rtt: 
     let act = unsafe { &mut *core::ptr::addr_of_mut!(ACTIVITY) };
     let (mut next, mut cur, mut seq) = (0usize, 0usize, 0u16);
     let mut rtt_cmd = CmdParser::new();
+    // RF health over one SUM window, sampled at 100 Hz: rssi min/max/sum/n, agc min/max.
+    let (mut rf, mut rf_tick) = ((i16::MAX, i16::MIN, 0i32, 0i32, u8::MAX, 0u8), 0u32);
+    // Software AFC: hardware AFC sits after the freq tap, so retune the LO from the sync fits instead.
+    let (mut afc_on, mut afc_base, mut afc_tick) = (true, 0u32, 0u32);
 
     if raw_mode == MODE_P25_DECODE {
         freq = option_env!("SWDR_P25_FREQ").and_then(|v| v.parse().ok()).unwrap_or(851_975_000);
@@ -180,10 +185,46 @@ async fn stream(mut radio: Radio, mut vcp: Vcp, mut iq: UpChannel, mut cmd_rtt: 
         }
 
         if raw_mode == MODE_P25_DECODE {
-            let now_s = TICKS.load(Ordering::Relaxed) / 100;
-            act.poll(now_s, decoder.frames_seen, decoder.nid_rejects, &mut |l| {
+            let tick = TICKS.load(Ordering::Relaxed);
+            if tick != rf_tick {
+                rf_tick = tick;
+                let (rssi, agc, _) = radio.rf_sample();
+                rf = (rf.0.min(rssi), rf.1.max(rssi), rf.2 + rssi as i32, rf.3 + 1, rf.4.min(agc), rf.5.max(agc));
+            }
+            let mut health = false;
+            act.poll(tick / 100, decoder.frames_seen, decoder.nid_rejects, &mut |l| {
+                health |= l.buf[..l.len].starts_with(b"SUM t=");
                 vcp.mark(core::str::from_utf8(&l.buf[..l.len]).unwrap_or("?"))
             });
+            // Every 2 s: dc/a = -3.3 needed LO -800 Hz on this site (242 Hz per unit, measured once).
+            // Half-gain steps, 60 Hz deadband, +-5 kHz range, so retunes (and lost frames) stay rare.
+            if afc_on && tick.wrapping_sub(afc_tick) >= 200 {
+                afc_tick = tick;
+                let (dc, a, n) = core::mem::take(&mut decoder.fit_sums);
+                if afc_base == 0 {
+                    afc_base = freq;
+                }
+                if n >= 5 && a > 0 {
+                    let err_hz = dc as i64 * 242 / a as i64;
+                    if err_hz.abs() > 60 {
+                        let off = (freq as i64 - afc_base as i64 + (err_hz / 2).clamp(-400, 400)).clamp(-5000, 5000);
+                        freq = (afc_base as i64 + off) as u32;
+                        radio.abort();
+                        radio.set_frequency(freq);
+                        PENDING.store(0, Ordering::Relaxed);
+                        next = 0;
+                        radio.start_raw(0b100, b0, unsafe { b0.add(PAYLOAD) }, PAYLOAD as u16);
+                    }
+                }
+            }
+            if health && rf.3 > 0 {
+                let mut l = tsbk::Line { buf: [0; 192], len: 0 };
+                let afc = radio.rf_sample().2;
+                let lo = if afc_base == 0 { 0 } else { freq as i32 - afc_base as i32 };
+                let _ = write!(l, "SUM rf rssi={}/{}/{}dBm agc={}..{} hw_afc={} lo={:+}Hz", rf.0, rf.2 / rf.3, rf.1, rf.4, rf.5, afc, lo);
+                vcp.mark(core::str::from_utf8(&l.buf[..l.len]).unwrap_or("?"));
+                rf = (i16::MAX, i16::MIN, 0, 0, u8::MAX, 0);
+            }
         }
 
         let mut cmd = vcp.poll_cmd();
@@ -196,11 +237,22 @@ async fn stream(mut radio: Radio, mut vcp: Vcp, mut iq: UpChannel, mut cmd_rtt: 
             act.interval_s = arg;
             cmd = None;
         }
+        if let Some((8, on)) = cmd {
+            afc_on = on != 0;
+            cmd = None;
+        }
+        if let Some((7, off)) = cmd {
+            let mut l = tsbk::Line { buf: [0; 192], len: 0 };
+            let _ = write!(l, "REG mr_subg+{:#05x} = {:#010x}", off & 0x3FC, radio.mr_read(off));
+            vcp.mark(core::str::from_utf8(&l.buf[..l.len]).unwrap_or("?"));
+            cmd = None;
+        }
         if let Some((op, arg)) = cmd {
             radio.abort();
             match op {
                 1 => {
                     freq = arg;
+                    afc_base = 0; // AFC offsets are relative to the last commanded frequency
                     radio.set_frequency(arg);
                 }
                 2 => {
@@ -208,6 +260,8 @@ async fn stream(mut radio: Radio, mut vcp: Vcp, mut iq: UpChannel, mut cmd_rtt: 
                     radio.set_rate_exp(rate);
                 }
                 3 => shift = arg.min(8),
+                // arg = offset << 16 | value; RX restarts below so the change applies from a clean start.
+                6 => radio.mr_write(arg >> 16, arg & 0xFFFF),
                 4 => {
                     raw_mode = (arg as u8).min(MODE_P25_DECODE);
                     if raw_mode != 0 {

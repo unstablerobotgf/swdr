@@ -17,6 +17,8 @@ const CMD_SABORT: u8 = 0x05;
 /// Undocumented SYNTH0_ANA_ENG (MR_SUBG+0xC0); ST's strobe macro pokes it around TX/RX commands.
 const SYNTH0_ANA_ENG: *mut u32 = 0x4900_00C0 as *mut u32;
 
+const MR_SUBG_BASE: u32 = 0x4900_0000;
+
 pub struct Radio {
     p: pac::Peripherals,
 }
@@ -170,6 +172,21 @@ impl Radio {
     pub fn rssi_dbm(&self) -> i16 {
         let raw = (self.p.status.rx_indicator().read().bits() >> 12) & 0x1FF;
         raw as i16 / 2 - 160
+    }
+
+    /// (RSSI dBm, AGC attenuation step, AFC estimate) for the per-window RF health line.
+    pub fn rf_sample(&self) -> (i16, u8, i8) {
+        let agc = self.p.status.rx_indicator().read().agc_word().bits();
+        (self.rssi_dbm(), agc, self.p.status.qi_info().read().afc_correction().bits() as i8)
+    }
+
+    /// Raw MR_SUBG register access for AGC/AFC experiments (ops 6/7); offsets per RM0511 29.10.
+    pub fn mr_write(&mut self, off: u32, v: u32) {
+        unsafe { ((MR_SUBG_BASE + (off & 0x3FC)) as *mut u32).write_volatile(v) }
+    }
+
+    pub fn mr_read(&self, off: u32) -> u32 {
+        unsafe { ((MR_SUBG_BASE + (off & 0x3FC)) as *const u32).read_volatile() }
     }
 
     /// __HAL_MRSUBG_STROBE_CMD, including ST's undocumented 0xC0 dance for TX/RX commands.
