@@ -48,6 +48,7 @@ cd firmware && cargo run --release        # flash + RTT log via the patched prob
 cd host && cargo build --release
 ./target/release/swdr --swd      # rtl_tcp on 127.0.0.1:1234, I/Q over SWD/RTT
 ./target/release/swdr --port COM11   # fallback over the VCP (62.5 kS/s max)
+./target/release/swdr --swd --probe 001A00123456789012345678   # pick one of several ST-Links
 ```
 
 Point an rtl_tcp client at `127.0.0.1:1234`, sample rate 250000. Gain steps select which 8 bits of
@@ -114,10 +115,15 @@ Signal path:
 - MRSUBG is configured for 4-FSK at 4800 sym/s, deviation 1800 Hz (inner symbols at FDEV/3) and a
   12.5 kHz channel filter. `FOUR_GFSK_CONST_MAP = 2` matches the P25 dibit mapping.
 - The radio's frequency-detector tap (`RX_MODE=100`, i8 at 15625 S/s) feeds `firmware/src/p25.rs`:
-  a 16-phase integrate-and-dump symbol bank sharing one boundary grid, frame sync on symbol signs,
-  a per-frame least-squares fit on the 24 sync symbols for DC and scale, status-symbol removal,
+  a 16-phase integrate-and-dump symbol bank sharing one boundary grid, frame sync on symbol signs
+  taken against a running symbol mean (so a carrier offset cannot push sync symbols across the
+  threshold), a per-frame least-squares fit on the 24 sync symbols for DC and scale, status-symbol removal,
   BCH(63,16,23) correction of the NID (up to 11 bit errors; frames with an uncorrectable NID are
   dropped), deinterleave, hard-decision Viterbi and CRC-16/GSM.
+- Software AFC: the radio's AFC acts after the frequency-detector tap, so it cannot center the
+  samples the decoder sees. Every 2 s the firmware steps the LO by half the offset implied by the
+  sync fits (60 Hz deadband, +-5 kHz range; `op 8` turns it off). Its Hz scale was measured once
+  and is biased at low SNR.
 - The radio's own hard-decision 4-FSK output (`RX_MODE=001`) also works, but recovered about 60% of
   TSBKs against a continuous control channel, so it is not used.
 
@@ -145,6 +151,8 @@ ALERT tg=1001 grants=12 in 30s vs baseline 1.0/window
 ```
 
 `SUM t=` is site health (TSBK rate, NID corrections and rejects, trellis corrections, site identity).
+`SUM rf rssi=min/mean/max agc=lo..hi hw_afc=N lo=+/-Hz` follows it: RSSI and AGC attenuation step
+sampled at 100 Hz over the window, the radio's AFC estimate and the software AFC's LO offset.
 `SUM tg=` lists the busiest talkgroups of the window. `ALERT` fires when a talkgroup's new grants
 reach 4x its EWMA baseline + 2 (minimum 3) once it has 4 windows of history.
 
@@ -162,7 +170,10 @@ listeners, radios grouped by their primary talkgroup, and recent registrations. 
 CSV through the same aggregator. `--raw raw.log` also keeps every board line with its receive time.
 `tools/p25_report.py events.csv raw.log report.html` renders a local HTML report (talkgroup activity
 heatmap, voice carriers in use for receiver sizing, busiest talkgroups, site health, registrations,
-radio groupings); it contains IDs from the monitored system, so keep it local. `tools/verify_updates.py`
+radio groupings); it contains IDs from the monitored system, so keep it local.
+`tools/p25_dashboard.py DATA_DIR [PORT]` serves a live local page (127.0.0.1:8025) over a running
+`live --csv --raw` collection: calls, talkgroups, per-second decode rate and the RF line for
+positioning an antenna (use `op 5 = 5` for 5 s summaries while doing so). `tools/verify_updates.py`
 cross-checks the board's per-window update counts against a raw log. Events come from group voice grants and updates, group affiliation
 and location registration responses, unit registration responses and deregistration acks.
 
@@ -172,7 +183,10 @@ and location registration responses, unit registration responses and deregistrat
   u8 I/Q (offset binary, rtl_sdr format). Fs = 2 MHz >> rate_exp.
 - Commands (RTT down-channel 0 or VCP RX): `C5 op arg:u32` little-endian. op 1 = frequency in Hz,
   2 = rate exponent, 3 = shift, 5 = summary interval in seconds, 4 = mode (0 I/Q; 1 hard bits, 2 frequency detector, 3 soft symbols as
-  raw frames tagged `0xF0 | RX_MODE`; 4 on-board P25 decoder).
+  raw frames tagged `0xF0 | RX_MODE`; 4 on-board P25 decoder), 6 = write an MR_SUBG register
+  (`offset << 16 | value`, RX restarts), 7 = read one (prints `REG ...`), 8 = software AFC on/off.
+  A command sent while the radio restarts from the previous one can be lost and leave the parser
+  mid-command; send six zero bytes first (op 0 is a no-op) and space commands by ~300 ms.
 
 ## STM32WL3x findings worth knowing
 
@@ -182,6 +196,8 @@ and location registration responses, unit registration responses and deregistrat
   can HardFault in ROM. `probe/STM32WL3_Series.yaml` moves it to 0x20001008.
 - The PA10 boot pin is latched only at **power-on** (`PWR_SR2.IOBOOTVAL`); B4 does not re-latch it.
   Per UM3418's pin table the BOOT0 jumper is CN3 pins 3–5 (pin 7 is SWDIO).
+- MRSUBG AGC and AFC both freeze on SYNC by default (`AGC2_CTRL`, `AFC2_CONFIG`). Around -90 dBm
+  the AGC stays at attenuation step 0, so its settings do not matter there.
 - Under-reset SWD connection never works on this part (debug domain unpowered while NRST is held).
 - `RFSEQ_STATUS_DETAIL` flags are sticky (rc_w1). `SABORT` never reports done if the FSM already
   left RX, so the abort wait is bounded.
