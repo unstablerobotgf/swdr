@@ -21,6 +21,7 @@ struct Args {
     port: String,
     swd: bool,
     yaml: String,
+    probe: Option<String>,
 }
 
 fn args() -> Args {
@@ -29,6 +30,7 @@ fn args() -> Args {
         port: "COM11".into(),
         swd: false,
         yaml: "../probe/STM32WL3_Series.yaml".into(),
+        probe: None,
     };
     let mut it = std::env::args().skip(1);
     while let Some(k) = it.next() {
@@ -37,7 +39,8 @@ fn args() -> Args {
             "--listen" => a.listen = it.next().unwrap_or_default(),
             "--port" => a.port = it.next().unwrap_or_default(),
             "--yaml" => a.yaml = it.next().unwrap_or_default(),
-            _ => panic!("usage: swdr [--swd [--yaml target.yaml] | --port COMx] [--listen addr:port]"),
+            "--probe" => a.probe = it.next(),
+            _ => panic!("usage: swdr [--swd [--yaml target.yaml] [--probe SERIAL] | --port COMx] [--listen addr:port]"),
         }
     }
     a
@@ -159,12 +162,16 @@ impl Link {
 }
 
 /// Attach over SWD once. USB is listed a single time: repeated probe sweeps upset other USB devices.
-fn open_swd(yaml_path: &str) -> Result<Link> {
+fn open_swd(yaml_path: &str, serial: Option<&str>) -> Result<Link> {
     let mut reg = Registry::from_builtin_families();
     let yaml = std::fs::read_to_string(yaml_path).with_context(|| format!("reading {yaml_path}"))?;
     reg.add_target_family_from_yaml(&yaml)?;
     let probes = Lister::new().list_all();
-    let info = probes.first().ok_or_else(|| anyhow::anyhow!("no debug probe found"))?;
+    // With several ST-LINKs attached, --probe picks one by serial; otherwise take the first.
+    let info = probes
+        .iter()
+        .find(|p| serial.is_none_or(|s| p.serial_number.as_deref() == Some(s)))
+        .ok_or_else(|| anyhow::anyhow!("no matching debug probe found"))?;
     let mut last = None;
     for _ in 0..3 {
         let mut probe = info.open()?;
@@ -194,7 +201,7 @@ fn main() -> Result<()> {
     let r = run.clone();
     ctrlc::set_handler(move || r.store(false, Ordering::Relaxed))?;
     let mut link = if a.swd {
-        open_swd(&a.yaml)?
+        open_swd(&a.yaml, a.probe.as_deref())?
     } else {
         let p = serialport::new(&a.port, 2_000_000).timeout(Duration::from_millis(20)).open();
         Link::Vcp(p.with_context(|| format!("opening {}", a.port))?)
