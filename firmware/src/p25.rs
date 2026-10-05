@@ -60,6 +60,8 @@ pub struct Decoder {
     frame: [i32; FRAME_MAX],
     len: usize,
     blocks_done: usize,
+    /// Running mean of symbol values (carrier offset). Sync signs are taken against it, not 0.
+    dc: i32,
     pub frames_seen: u32,
     pub nid_rejects: u32,
 }
@@ -80,6 +82,7 @@ impl Decoder {
             frame: [0; FRAME_MAX],
             len: 0,
             blocks_done: 0,
+            dc: 0,
             frames_seen: 0,
             nid_rejects: 0,
         }
@@ -109,8 +112,14 @@ impl Decoder {
     }
 
     fn symbol(&mut self, p: usize, v: i32, emit: &mut impl FnMut(&Tsbk)) {
+        // Offsets past ~-800 Hz pushed +3 sync symbols below 0 and blinded the sync search.
+        // Phase 0 only: 1024-symbol (~0.2 s) time constant.
+        if p == 0 {
+            self.dc += (v - self.dc) >> 10;
+        }
+        let dc = self.dc;
         let ph = &mut self.ph[p];
-        ph.signs = ((ph.signs << 1) | (v > 0) as u32) & 0xFF_FFFF;
+        ph.signs = ((ph.signs << 1) | (v > dc) as u32) & 0xFF_FFFF;
         ph.ring[ph.pos] = v;
         ph.pos = (ph.pos + 1) % RING;
 
@@ -157,7 +166,7 @@ impl Decoder {
             let mut signs = 0u32;
             for k in 0..24 {
                 let idx = (ph.pos + RING - 1 - back - (23 - k)) % RING;
-                signs = (signs << 1) | (ph.ring[idx] > 0) as u32;
+                signs = (signs << 1) | (ph.ring[idx] > self.dc) as u32;
             }
             if (signs ^ SYNC_SIGNS).count_ones() <= 2 {
                 return back;
