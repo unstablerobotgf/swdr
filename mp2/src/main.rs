@@ -23,6 +23,8 @@ mod p2;
 #[allow(dead_code)]
 mod p25;
 mod rs63;
+#[cfg(feature = "vocoder")]
+mod vocoder;
 #[path = "../../firmware/src/tsbk.rs"]
 mod tsbk;
 
@@ -100,6 +102,24 @@ fn main() -> std::io::Result<()> {
             }
             for x in &pdus {
                 println!("{}", p2_line(x));
+            }
+            // --wav OUT [--lch N]: synthesise that logical channel's voice (vocoder builds only).
+            if let Some(wav) = args.iter().position(|a| a == "--wav").and_then(|i| args.get(i + 1)) {
+                let lch: u8 = arg(&args, "--lch", 0);
+                let frames: Vec<p2::VoiceFrame> = p.voice.iter().copied().filter(|v| v.lch == lch).collect();
+                #[cfg(feature = "vocoder")]
+                {
+                    let (mut v, mut w, mut bad) = (vocoder::Vocoder::new(), vocoder::Wav::create(wav)?, 0);
+                    for f in &frames {
+                        let (pcm, e1, _) = v.frame(f.c);
+                        bad += (e1 > 0) as u32;
+                        w.write(&pcm)?;
+                    }
+                    w.finish()?;
+                    eprintln!("swdr-tap: {wav}: {} frames ({:.2}s) on lch {lch}, {bad} with corrected bits", frames.len(), frames.len() as f32 * 0.02);
+                }
+                #[cfg(not(feature = "vocoder"))]
+                eprintln!("swdr-tap: {} voice frames on lch {lch}; --wav needs a build with --features vocoder ({wav} not written)", frames.len());
             }
             let mut tgs: Vec<u16> = pdus.iter().filter_map(|x| x.tg).collect();
             tgs.sort();

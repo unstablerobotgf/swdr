@@ -8,6 +8,16 @@ use crate::rs63;
 
 const BURST: u64 = 180;
 const SYNC: u64 = 0x575D_57F7_FF;
+/// Vocoder frame bit k (MSB of each dibit first) -> (codeword, bit), bit 0 = LSB of c0..c3.
+const VCW: [(u8, u8); 72] = [
+    (0, 23), (0, 5), (1, 10), (2, 3), (0, 22), (0, 4), (1, 9), (2, 2), (0, 21), (0, 3), (1, 8), (2, 1),
+    (0, 20), (0, 2), (1, 7), (2, 0), (0, 19), (0, 1), (1, 6), (3, 13), (0, 18), (0, 0), (1, 5), (3, 12),
+    (0, 17), (1, 22), (1, 4), (3, 11), (0, 16), (1, 21), (1, 3), (3, 10), (0, 15), (1, 20), (1, 2), (3, 9),
+    (0, 14), (1, 19), (1, 1), (3, 8), (0, 13), (1, 18), (1, 0), (3, 7), (0, 12), (1, 17), (2, 10), (3, 6),
+    (0, 11), (1, 16), (2, 9), (3, 5), (0, 10), (1, 15), (2, 8), (3, 4), (0, 9), (1, 14), (2, 7), (3, 3),
+    (0, 8), (1, 13), (2, 6), (3, 2), (0, 7), (1, 12), (2, 5), (3, 1), (0, 6), (1, 11), (2, 4), (3, 0),
+];
+
 /// Superframe slot -> logical channel; slots 10 and 11 are swapped.
 const LCH: [u8; 12] = [0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 1, 0];
 const DUID_CW: [u8; 16] = [0x00, 0x17, 0x2E, 0x39, 0x4B, 0x5C, 0x65, 0x72, 0x8D, 0x9A, 0xA3, 0xB4, 0xC6, 0xD1, 0xE8, 0xFF];
@@ -33,6 +43,15 @@ pub struct Pdu {
     /// Logical channel (0/1) of the burst; matches the grant's channel-number LSB.
     pub lch: u8,
     pub fast: bool,
+    /// MAC_PTT encryption algorithm (0x80 = clear).
+    pub alg: Option<u8>,
+}
+
+/// One 20 ms AMBE+2 3600x2450 frame as codewords c0 (24), c1 (23), c2 (11), c3 (14).
+#[derive(Debug, Clone, Copy)]
+pub struct VoiceFrame {
+    pub lch: u8,
+    pub c: [u32; 4],
 }
 
 /// Superframe scrambling dibits: 44-bit Galois LFSR (taps 40,35,29,24,10,0) seeded with
@@ -115,7 +134,8 @@ fn parse(p: &[u8], slot: u8, fast: bool) -> Pdu {
     } else if matches!(kind, Kind::Idle | Kind::Active | Kind::Hangtime) && p[1] == 0x01 {
         (tg, src) = (Some(be(3, 2) as u16), Some(be(5, 3))); // Group Voice Channel User (abbreviated)
     }
-    Pdu { kind, tg, src, mco: p[1], slot, lch: LCH[slot as usize], fast }
+    let alg = matches!(kind, Kind::Ptt).then(|| p[10]);
+    Pdu { kind, tg, src, mco: p[1], slot, lch: LCH[slot as usize], fast, alg }
 }
 
 pub struct P2 {
@@ -131,11 +151,13 @@ pub struct P2 {
     pub slots: u64,
     pub acch: u64,
     pub acch_good: u64,
+    /// Voice frames from 4V/2V bursts, appended as they are cut; callers drain it.
+    pub voice: Vec<VoiceFrame>,
 }
 
 impl P2 {
     pub fn new(nac: u16, sysid: u16, wacn: u32) -> Self {
-        Self { xm: scrambler(nac, sysid, wacn), hist: Vec::new(), hist0: 0, n: 0, acc: 0, hits: Vec::new(), anchor: None, next: (0, 0), good: [0; 3], slots: 0, acch: 0, acch_good: 0 }
+        Self { xm: scrambler(nac, sysid, wacn), hist: Vec::new(), hist0: 0, n: 0, acc: 0, hits: Vec::new(), anchor: None, next: (0, 0), good: [0; 3], slots: 0, acch: 0, acch_good: 0, voice: Vec::new() }
     }
 
     pub fn locked(&self) -> bool {
@@ -200,6 +222,25 @@ impl P2 {
     fn unit(&mut self, unit: &[u8], rel: i64, out: &mut Vec<Pdu>) {
         let burst = &unit[10..];
         let Some(d) = duid(burst) else { return };
+        if d == 0 || d == 6 {
+            // Voice is always scrambled; use the superframe position the ACCH CRCs settled on.
+            let k = (0..3).max_by_key(|&k| self.good[k]).unwrap();
+            if self.good[k] == 0 {
+                return;
+            }
+            let slot = ((2 + 4 * k as i64 + rel).rem_euclid(12)) as usize;
+            let b: Vec<u8> = burst.iter().zip(&self.xm[slot * BURST as usize..]).map(|(a, m)| a ^ m).collect();
+            let starts: &[usize] = if d == 0 { &[11, 48, 96, 133] } else { &[11, 48] };
+            for &s in starts {
+                let mut c = [0u32; 4];
+                for (i, &(w, bit)) in VCW.iter().enumerate() {
+                    let v = (b[s + i / 2] >> (1 - i % 2)) & 1;
+                    c[w as usize] |= (v as u32) << bit;
+                }
+                self.voice.push(VoiceFrame { lch: LCH[slot], c });
+            }
+            return;
+        }
         let (fast, scrambled) = match d {
             3 => (false, true),
             12 => (false, false),

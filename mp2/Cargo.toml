@@ -8,6 +8,10 @@ description = "STM32MP257F-DK side of the swdr SPI link: frame reader and P25 de
 [dependencies]
 libc = "0.2"
 
+[features]
+# Link mbelib for AMBE+2 synthesis (patented DVSI codec; off by default).
+vocoder = []
+
 [profile.release]
 opt-level = 3
 lto = true
