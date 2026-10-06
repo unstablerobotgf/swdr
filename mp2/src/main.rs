@@ -10,14 +10,19 @@
 //! control channel, follow a group grant to its voice channel, record --dwell s of I/Q there to
 //! DIR/hop_N_tgT_HZ.u8, then return to --cc. --ppm corrects every retune for the WL33 crystal
 //! (the firmware's AFC held -1005 Hz at 851.975 MHz, i.e. about -1.18 ppm).
+//! With --nac --sysid --wacn (hex, from the CC's NET/RFSS_STATUS) each hop decodes the Phase 2
+//! MAC live and follows the call: --dwell is the acquisition window, each MAC_ACTIVE/PTT for the
+//! granted talkgroup extends the stay by --hold s, MAC_END_PTT for it leaves, --maxdwell caps it.
 #[path = "../../firmware/src/bch.rs"]
 mod bch;
 mod cqpsk;
 mod hop;
 mod link;
+mod p2;
 #[path = "../../firmware/src/p25.rs"]
 #[allow(dead_code)]
 mod p25;
+mod rs63;
 #[path = "../../firmware/src/tsbk.rs"]
 mod tsbk;
 
@@ -41,6 +46,19 @@ fn decode(dec: &mut p25::Decoder, idens: &mut tsbk::Idens, samples: &[i8], got: 
     });
     let _ = o.flush();
     n
+}
+
+fn hexarg(args: &[String], name: &str) -> Option<u32> {
+    args.iter().position(|a| a == name).and_then(|i| args.get(i + 1)).and_then(|v| u32::from_str_radix(v, 16).ok())
+}
+
+fn p2_line(p: &p2::Pdu) -> String {
+    let mut s = format!("P2 slot={:2} {} {:?}", p.slot, if p.fast { "FACCH" } else { "SACCH" }, p.kind);
+    match (p.tg, p.src) {
+        (Some(t), Some(r)) => s += &format!(" tg={t} src={r}"),
+        _ => s += &format!(" mco=0x{:02x}", p.mco),
+    }
+    s
 }
 
 fn main() -> std::io::Result<()> {
@@ -67,6 +85,31 @@ fn main() -> std::io::Result<()> {
     if let Some(path) = args.iter().position(|a| a == "--input").and_then(|i| args.get(i + 1)) {
         let fs: f32 = arg(&args, "--fs", 31250.0);
         let data = std::fs::read(path)?;
+        if args.windows(2).any(|w| w[0] == "--demod" && w[1] == "p2") {
+            let ids = (hexarg(&args, "--nac"), hexarg(&args, "--sysid"), hexarg(&args, "--wacn"));
+            let (Some(nac), Some(sysid), Some(wacn)) = ids else {
+                eprintln!("swdr-tap: --demod p2 needs --nac --sysid --wacn (hex)");
+                return Ok(());
+            };
+            let (mut d, mut p) = (cqpsk::Cqpsk::with_rate(fs, cqpsk::P2_SYM), p2::P2::new(nac as u16, sysid as u16, wacn));
+            let (mut dib, mut pdus, t) = (Vec::new(), Vec::new(), Instant::now());
+            for chunk in data.chunks(1024) {
+                dib.clear();
+                d.push_dibits(chunk, &mut dib);
+                p.push(&dib, &mut pdus);
+            }
+            for x in &pdus {
+                println!("{}", p2_line(x));
+            }
+            let mut tgs: Vec<u16> = pdus.iter().filter_map(|x| x.tg).collect();
+            tgs.sort();
+            tgs.dedup();
+            eprintln!(
+                "swdr-tap: {path}: {:.1}s in {:.2}s, {} symbols, level err {:.3}, slots {}, ACCH {}/{} CRC good, talkgroups {:?}",
+                data.len() as f32 / 2.0 / fs, t.elapsed().as_secs_f32(), d.symbols, d.level_err, p.slots, p.acch_good, p.acch, tgs
+            );
+            return Ok(());
+        }
         let (mut d, mut dec, mut idens) = (cqpsk::Cqpsk::new(fs), p25::Decoder::new(), tsbk::Idens::new());
         let t = Instant::now();
         let mut n = 0;
@@ -93,12 +136,20 @@ fn main() -> std::io::Result<()> {
     }
     struct Voice {
         until: Instant,
+        start: Instant,
         file: std::fs::File,
         tg: u32,
         hz: u32,
         frames: u64,
         sum2: f64,
+        p2: Option<(cqpsk::Cqpsk, p2::P2)>,
+        seen: u32,
+        why: &'static str,
     }
+    let ids = (hexarg(&args, "--nac"), hexarg(&args, "--sysid"), hexarg(&args, "--wacn"));
+    let (hold, maxdwell): (f64, f64) = (arg(&args, "--hold", 1.0), arg(&args, "--maxdwell", 30.0));
+    let mut dib: Vec<u8> = Vec::with_capacity(1024);
+    let mut pdus: Vec<p2::Pdu> = Vec::new();
     let (mut voice, mut skip, mut hops, mut last_hop): (Option<Voice>, u32, u32, Option<Instant>) = (None, 0, 0, None);
     let mut got: Vec<[u8; 12]> = Vec::new();
     let started = Instant::now();
@@ -158,9 +209,39 @@ fn main() -> std::io::Result<()> {
                 v.file.write_all(payload)?;
                 v.frames += 1;
                 v.sum2 += payload.iter().map(|&b| (b as f64 - 127.5).powi(2)).sum::<f64>() / payload.len() as f64;
+                if let Some((d, p)) = v.p2.as_mut() {
+                    dib.clear();
+                    pdus.clear();
+                    d.push_dibits(payload, &mut dib);
+                    p.push(&dib, &mut pdus);
+                    let now_s = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs_f64();
+                    for x in &pdus {
+                        println!("{now_s:.3}	hop={hops} {} Hz {}", v.hz, p2_line(x));
+                        if x.tg != Some(v.tg as u16) {
+                            continue;
+                        }
+                        v.seen += 1;
+                        match x.kind {
+                            p2::Kind::Active | p2::Kind::Ptt => {
+                                v.until = v.until.max(Instant::now() + std::time::Duration::from_secs_f64(hold));
+                                v.why = "hold expired";
+                            }
+                            p2::Kind::EndPtt => (v.until, v.why) = (Instant::now(), "END_PTT"),
+                            _ => {}
+                        }
+                    }
+                    let cap = v.start + std::time::Duration::from_secs_f64(maxdwell);
+                    if Instant::now() >= cap {
+                        (v.until, v.why) = (cap, "maxdwell");
+                    }
+                }
                 if Instant::now() >= v.until {
                     link.command(1, lo(cc_hz));
-                    eprintln!("swdr-tap: hop {hops} back to cc: tg={} {} Hz, {} frames, rms {:.1}", v.tg, v.hz, v.frames, (v.sum2 / v.frames as f64).sqrt());
+                    let (slots, good, acch) = v.p2.as_ref().map_or((0, 0, 0), |(_, p)| (p.slots, p.acch_good, p.acch));
+                    eprintln!(
+                        "swdr-tap: hop {hops} back to cc after {:.1}s ({}): tg={} {} Hz, {} frames, rms {:.1}, slots {slots}, ACCH {good}/{acch}, tg seen {}x",
+                        v.start.elapsed().as_secs_f64(), v.why, v.tg, v.hz, v.frames, (v.sum2 / v.frames as f64).sqrt(), v.seen
+                    );
                     voice = None;
                     skip = 3;
                 }
@@ -183,7 +264,12 @@ fn main() -> std::io::Result<()> {
                         link.command(1, lo(g.hz));
                         eprintln!("swdr-tap: hop {hops} tg={} ch={}-{} {} Hz -> {path}", g.tg, g.ch >> 12, g.ch & 0xFFF, g.hz);
                         let until = Instant::now() + std::time::Duration::from_secs_f64(dwell);
-                        voice = Some(Voice { until, file: std::fs::File::create(path)?, tg: g.tg, hz: g.hz, frames: 0, sum2: 0.0 });
+                        let p2 = match ids {
+                            (Some(n), Some(s), Some(w)) => Some((cqpsk::Cqpsk::with_rate(fs, cqpsk::P2_SYM), p2::P2::new(n as u16, s as u16, w))),
+                            _ => None,
+                        };
+                        let why = if p2.is_some() { "no MAC for tg in acquisition window" } else { "dwell" };
+                        voice = Some(Voice { until, start: Instant::now(), file: std::fs::File::create(path)?, tg: g.tg, hz: g.hz, frames: 0, sum2: 0.0, p2, seen: 0, why });
                         (skip, last_hop) = (3, Some(Instant::now()));
                     }
                 }

@@ -1,10 +1,13 @@
-//! Streaming P25 Phase 1 CQPSK (LSM) demodulator, ported from tools/cqpsk_demod.py.
-//! u8 offset-binary I/Q in; out comes a 15625 S/s i8 stream shaped like the WL33 freq tap
-//! (each symbol level held for 15625/4800 samples) so the firmware's p25::Decoder runs unchanged.
+//! Streaming differential QPSK demodulator for P25: Phase 1 CQPSK (LSM, 4800 sym/s) and
+//! Phase 2 H-DQPSK (6000 sym/s); ported from tools/cqpsk_demod.py.
+//! u8 offset-binary I/Q in. `push` emits a 15625 S/s i8 stream shaped like the WL33 freq tap
+//! (each level held for 15625/sym samples) so the firmware's p25::Decoder runs unchanged;
+//! `push_dibits` emits hard dibit decisions instead (P25 mapping: +3 -> 1, +1 -> 0, -1 -> 2, -3 -> 3).
 
 use std::f32::consts::{FRAC_PI_4, PI, TAU};
 
-const SYM: f32 = 4800.0;
+pub const P1_SYM: f32 = 4800.0;
+pub const P2_SYM: f32 = 6000.0;
 const TAP_FS: f32 = 15625.0;
 /// i8 counts per symbol unit (+-1, +-3 -> +-20, +-60); the decoder fits its own scale.
 const TAP_GAIN: f32 = 20.0;
@@ -52,6 +55,7 @@ fn rrc(sps: f32, alpha: f32, span: f32) -> Vec<f32> {
 
 pub struct Cqpsk {
     fs: f32,
+    sym: f32,
     sps: f32,
     taps: Vec<f32>,
     hist: Vec<C>, // FIR delay line (ring)
@@ -59,6 +63,7 @@ pub struct Cqpsk {
     // carrier: slow mean of the per-sample discriminator, then an NCO
     last_in: C,
     off: f32, // rad/sample
+    nsamp: f32,
     nco: f32,
     agc: f32,
     // Gardner over filtered samples kept in `y` (front trimmed as symbols are taken)
@@ -75,16 +80,22 @@ pub struct Cqpsk {
 
 impl Cqpsk {
     pub fn new(fs: f32) -> Self {
-        let sps = fs / SYM;
+        Self::with_rate(fs, P1_SYM)
+    }
+
+    pub fn with_rate(fs: f32, sym: f32) -> Self {
+        let sps = fs / sym;
         let taps = rrc(sps, 0.2, 8.0);
         Self {
             fs,
+            sym,
             sps,
             hist: vec![C::default(); taps.len()],
             taps,
             hpos: 0,
             last_in: C(1.0, 0.0),
             off: 0.0,
+            nsamp: 0.0,
             nco: 0.0,
             agc: 1.0,
             y: Vec::with_capacity(4096),
@@ -104,12 +115,36 @@ impl Cqpsk {
 
     /// Feed interleaved u8 I/Q; appends freq-tap-like i8 samples to `out`.
     pub fn push(&mut self, iq: &[u8], out: &mut Vec<i8>) {
+        let mut lv = Vec::new();
+        self.levels(iq, &mut lv);
+        for v in lv {
+            self.hold += TAP_FS / self.sym;
+            let v = (v * TAP_GAIN).clamp(-127.0, 127.0) as i8;
+            while self.hold >= 1.0 {
+                out.push(v);
+                self.hold -= 1.0;
+            }
+        }
+    }
+
+    /// Feed interleaved u8 I/Q; appends one hard dibit per symbol to `out`.
+    pub fn push_dibits(&mut self, iq: &[u8], out: &mut Vec<u8>) {
+        let mut lv = Vec::new();
+        self.levels(iq, &mut lv);
+        out.extend(lv.iter().map(|&v| if v >= 2.0 { 1 } else if v >= 0.0 { 0 } else if v >= -2.0 { 2 } else { 3 }));
+    }
+
+    /// Feed interleaved u8 I/Q; appends one symbol level (+-1, +-3 ideal) per symbol.
+    pub fn levels(&mut self, iq: &[u8], out: &mut Vec<f32>) {
         for p in iq.chunks_exact(2) {
             let x = C(p[0] as f32 - 127.5, p[1] as f32 - 127.5);
-            // Carrier offset: the discriminator's long-run mean (data is symmetric), ~2 s time constant.
+            // Carrier offset: the discriminator's mean (data is symmetric). For the first second a
+            // ~0.1 s time constant (forgets the retune transient), then ~2 s.
             let d = x.mul(self.last_in.conj()).arg();
             self.last_in = x;
-            self.off += (d - self.off) * 1.6e-5;
+            self.nsamp += 1.0;
+            let a = if self.nsamp < self.fs { (1.0 / self.nsamp).max(3e-4) } else { 1.6e-5 };
+            self.off += (d - self.off) * a;
             self.nco = (self.nco - self.off) % TAU;
             let z = x.mul(C(self.nco.cos(), self.nco.sin()));
             self.hist[self.hpos] = z;
@@ -131,7 +166,7 @@ impl Cqpsk {
         self.y[i].lerp(self.y[i + 1], p - i as f32)
     }
 
-    fn gardner(&mut self, out: &mut Vec<i8>) {
+    fn gardner(&mut self, out: &mut Vec<f32>) {
         const BW: f32 = 0.01;
         let (g1, g2) = (4.0 * BW, 4.0 * BW * BW);
         while self.k + self.sps + 2.0 < self.y.len() as f32 {
@@ -155,7 +190,7 @@ impl Cqpsk {
         }
     }
 
-    fn symbol(&mut self, d: C, out: &mut Vec<i8>) {
+    fn symbol(&mut self, d: C, out: &mut Vec<f32>) {
         // 4th power of the unit differential folds +-pi/4, +-3pi/4 onto -1; its angle/4 is the residual rotation.
         let n = d.norm2().sqrt().max(1e-9);
         let u = C(d.0 / n, d.1 / n);
@@ -167,11 +202,6 @@ impl Cqpsk {
         let ideal = (((lv - 1.0) / 2.0).round() * 2.0 + 1.0).clamp(-3.0, 3.0);
         self.level_err += ((lv - ideal).abs() - self.level_err) * 1e-3;
         self.symbols += 1;
-        self.hold += TAP_FS / SYM;
-        let v = (lv * TAP_GAIN).clamp(-127.0, 127.0) as i8;
-        while self.hold >= 1.0 {
-            out.push(v);
-            self.hold -= 1.0;
-        }
+        out.push(lv);
     }
 }
