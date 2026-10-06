@@ -13,6 +13,9 @@
 //! With --nac --sysid --wacn (hex, from the CC's NET/RFSS_STATUS) each hop decodes the Phase 2
 //! MAC live and follows the call: --dwell is the acquisition window, each MAC_ACTIVE/PTT for the
 //! granted talkgroup extends the stay by --hold s, MAC_END_PTT for it leaves, --maxdwell caps it.
+//! --calls DIR (vocoder builds): each followed call's voice on its slot -> DIR/<unix>_tg<T>_<Hz>_<alg>.wav,
+//! where alg is "clear" (MAC_PTT algid 0x80) or "alg-unknown" (joined after the PTT); calls whose
+//! PTT shows any other algid are dropped and their file deleted.
 #[path = "../../firmware/src/bch.rs"]
 mod bch;
 mod cqpsk;
@@ -167,6 +170,16 @@ fn main() -> std::io::Result<()> {
         p2: Option<(cqpsk::Cqpsk, p2::P2)>,
         seen: u32,
         why: &'static str,
+        alg: Option<u8>,
+        #[cfg(feature = "vocoder")]
+        audio: Option<(vocoder::Vocoder, vocoder::Wav, String)>,
+    }
+    let calls: Option<String> = args.iter().position(|a| a == "--calls").and_then(|i| args.get(i + 1)).cloned();
+    if let Some(d) = calls.as_ref() {
+        std::fs::create_dir_all(d)?;
+        if !cfg!(feature = "vocoder") {
+            eprintln!("swdr-tap: --calls ignored: built without the vocoder feature");
+        }
     }
     let ids = (hexarg(&args, "--nac"), hexarg(&args, "--sysid"), hexarg(&args, "--wacn"));
     let (hold, maxdwell): (f64, f64) = (arg(&args, "--hold", 1.0), arg(&args, "--maxdwell", 30.0));
@@ -241,6 +254,9 @@ fn main() -> std::io::Result<()> {
                     let now_s = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs_f64();
                     for x in &pdus {
                         println!("{now_s:.3}	hop={hops} {} Hz {}", v.hz, p2_line(x));
+                        if x.lch == v.lch && x.tg == Some(v.tg as u16) && x.alg.is_some() {
+                            v.alg = x.alg;
+                        }
                         // Only our timeslot's signalling; the other slot carries a different call.
                         if x.tg != Some(v.tg as u16) || x.lch != v.lch {
                             continue;
@@ -255,6 +271,29 @@ fn main() -> std::io::Result<()> {
                             _ => {}
                         }
                     }
+                    #[cfg(feature = "vocoder")]
+                    if let Some(dir) = calls.as_ref() {
+                        let mine: Vec<p2::VoiceFrame> = p.voice.drain(..).filter(|f| f.lch == v.lch).collect();
+                        if v.alg.is_some_and(|a| a != 0x80) {
+                            if let Some((_, _, path)) = v.audio.take() {
+                                let _ = std::fs::remove_file(&path);
+                                eprintln!("swdr-tap: hop {hops} tg={} encrypted (algid 0x{:02x}), not recorded", v.tg, v.alg.unwrap());
+                            }
+                        } else if !mine.is_empty() {
+                            if v.audio.is_none() {
+                                let path = format!("{dir}/{}_tg{}_{}_pending.wav", now_s as u64, v.tg, v.hz);
+                                v.audio = Some((vocoder::Vocoder::new(), vocoder::Wav::create(&path)?, path));
+                            }
+                            let (voc, wav, _) = v.audio.as_mut().unwrap();
+                            for f in mine {
+                                wav.write(&voc.frame(f.c).0)?;
+                            }
+                        }
+                    } else {
+                        p.voice.clear();
+                    }
+                    #[cfg(not(feature = "vocoder"))]
+                    p.voice.clear();
                     let cap = v.start + std::time::Duration::from_secs_f64(maxdwell);
                     if Instant::now() >= cap {
                         (v.until, v.why) = (cap, "maxdwell");
@@ -262,6 +301,14 @@ fn main() -> std::io::Result<()> {
                 }
                 if Instant::now() >= v.until {
                     link.command(1, lo(cc_hz));
+                    #[cfg(feature = "vocoder")]
+                    if let Some((_, wav, path)) = v.audio.take() {
+                        wav.finish()?;
+                        let tag = if v.alg == Some(0x80) { "clear" } else { "alg-unknown" };
+                        let fin = path.replace("_pending.wav", &format!("_{tag}.wav"));
+                        std::fs::rename(&path, &fin)?;
+                        eprintln!("swdr-tap: hop {hops} call audio -> {fin}");
+                    }
                     let (slots, good, acch) = v.p2.as_ref().map_or((0, 0, 0), |(_, p)| (p.slots, p.acch_good, p.acch));
                     eprintln!(
                         "swdr-tap: hop {hops} back to cc after {:.1}s ({}): tg={} {} Hz, {} frames, rms {:.1}, slots {slots}, ACCH {good}/{acch}, tg seen {}x",
@@ -294,7 +341,10 @@ fn main() -> std::io::Result<()> {
                             _ => None,
                         };
                         let why = if p2.is_some() { "no MAC for tg in acquisition window" } else { "dwell" };
-                        voice = Some(Voice { until, start: Instant::now(), file: if record { Some(std::fs::File::create(&path)?) } else { None }, tg: g.tg, hz: g.hz, lch: g.slot, frames: 0, sum2: 0.0, p2, seen: 0, why });
+                        voice = Some(Voice { until, start: Instant::now(), file: if record { Some(std::fs::File::create(&path)?) } else { None }, tg: g.tg, hz: g.hz, lch: g.slot, frames: 0, sum2: 0.0, p2, seen: 0, why, alg: None,
+                            #[cfg(feature = "vocoder")]
+                            audio: None,
+                        });
                         (skip, last_hop) = (3, Some(Instant::now()));
                     }
                 }
