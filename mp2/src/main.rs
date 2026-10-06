@@ -3,9 +3,12 @@
 //! (the swdr-p25 raw.log format); link and decode stats go to stderr.
 //! usage: swdr-tap [--hz 16000000] [--stats 30] [--secs N] [--dump FILE.i8] [--iq FILE.u8] [--cmd OP:ARG]...
 //! --cmd sends C5 commands to the WL33 over the link, one every 16 frames, in order.
-//! Kind-2 (I/Q) frames go to --iq as interleaved u8 offset-binary I/Q.
+//! Kind-2 (I/Q) frames go to --iq as interleaved u8 offset-binary I/Q; with --demod cqpsk they
+//! are also CQPSK-demodulated (Fs from the frame's rate_exp) into the same decoder.
+//! --input FILE.u8 [--fs 31250] replays a recorded I/Q file through --demod instead of the link.
 #[path = "../../firmware/src/bch.rs"]
 mod bch;
+mod cqpsk;
 mod link;
 #[path = "../../firmware/src/p25.rs"]
 #[allow(dead_code)]
@@ -18,6 +21,20 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 fn arg<T: std::str::FromStr>(args: &[String], name: &str, default: T) -> T {
     args.iter().position(|a| a == name).and_then(|i| args.get(i + 1)).and_then(|v| v.parse().ok()).unwrap_or(default)
+}
+
+/// Decode freq-tap-like samples, printing TSBKs as `unix_time	line`; returns how many.
+fn decode(dec: &mut p25::Decoder, idens: &mut tsbk::Idens, samples: &[i8]) -> u64 {
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs_f64();
+    let mut o = std::io::stdout().lock();
+    let mut n = 0;
+    dec.push(samples, &mut |t| {
+        let l = tsbk::format(t.nac, &t.bytes, t.trellis_errs, t.nid_errs, idens);
+        let _ = writeln!(o, "{:.3}	{}", now, String::from_utf8_lossy(&l.buf[..l.len]));
+        n += 1;
+    });
+    let _ = o.flush();
+    n
 }
 
 fn main() -> std::io::Result<()> {
@@ -38,6 +55,26 @@ fn main() -> std::io::Result<()> {
         .filter(|w| w[0] == "--cmd")
         .filter_map(|w| w[1].split_once(':').and_then(|(o, a)| Some((o.parse().ok()?, a.parse().ok()?))))
         .collect();
+    let use_cqpsk = args.windows(2).any(|w| w[0] == "--demod" && w[1] == "cqpsk");
+    let mut demod: Option<cqpsk::Cqpsk> = None;
+    let mut tapbuf: Vec<i8> = Vec::with_capacity(4096);
+    if let Some(path) = args.iter().position(|a| a == "--input").and_then(|i| args.get(i + 1)) {
+        let fs: f32 = arg(&args, "--fs", 31250.0);
+        let data = std::fs::read(path)?;
+        let (mut d, mut dec, mut idens) = (cqpsk::Cqpsk::new(fs), p25::Decoder::new(), tsbk::Idens::new());
+        let t = Instant::now();
+        let mut n = 0;
+        for chunk in data.chunks(1024) {
+            tapbuf.clear();
+            d.push(chunk, &mut tapbuf);
+            n += decode(&mut dec, &mut idens, &tapbuf);
+        }
+        eprintln!(
+            "swdr-tap: {path}: {:.1}s of I/Q in {:.2}s, {} symbols, carrier {:+.0} Hz, level err {:.3}, tsbk={n} syncs={} nid_rej={}",
+            data.len() as f32 / 2.0 / fs, t.elapsed().as_secs_f32(), d.symbols, d.carrier_hz(), d.level_err, dec.frames_seen, dec.nid_rejects
+        );
+        return Ok(());
+    }
     let started = Instant::now();
     let (mut iq_frames, mut xfers) = (0u64, 0u64);
     let mut link = link::Link::open("/dev/spidev0.0", "/dev/gpiochip9", 0, hz)?;
@@ -86,6 +123,14 @@ fn main() -> std::io::Result<()> {
             iq_frames += 1;
             if let Some(w) = iq.as_mut() {
                 w.write_all(payload)?;
+            }
+            if use_cqpsk {
+                let fs = 2_000_000.0 / (1u32 << (h.flags & 0xF)) as f32;
+                let d = demod.get_or_insert_with(|| cqpsk::Cqpsk::new(fs));
+                tapbuf.clear();
+                d.push(payload, &mut tapbuf);
+                let n = decode(&mut dec, &mut idens, &tapbuf);
+                (tsbks, win_tsbk) = (tsbks + n, win_tsbk + n);
             }
             continue;
         }
