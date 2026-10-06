@@ -29,3 +29,5 @@ codegen-units = 1
 [features]
 # Boot straight into on-board P25 TSBK decoding (frequency: SWDR_P25_FREQ at build time).
 p25 = []
+# SPI1 slave link bring-up to the MP257F-DK: counting test frames, radio left off.
+spilink = []

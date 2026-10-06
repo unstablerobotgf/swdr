@@ -6,6 +6,7 @@ mod bch;
 mod p25;
 mod radio;
 mod rcc;
+mod spi;
 mod tsbk;
 mod uart;
 
@@ -287,6 +288,65 @@ async fn stream(mut radio: Radio, mut vcp: Vcp, mut iq: UpChannel, mut cmd_rtt: 
     }
 }
 
+static mut LINK_TX: spi::Frame = spi::Frame::new();
+static mut LINK_RX: [u8; spi::FRAME] = [0; spi::FRAME];
+
+/// SPI link bring-up: counting frames to the DK as fast as it reads them, no radio.
+/// Payload byte i of frame `seq` is (seq + i) as u8.
+#[embassy_executor::task]
+async fn spilink(vcp: Vcp) {
+    let mut link = spi::Link::new();
+    let (tx, rx) = unsafe { (&mut *core::ptr::addr_of_mut!(LINK_TX), &mut *core::ptr::addr_of_mut!(LINK_RX)) };
+    let (mut seq, mut cmds, mut aborts, mut ovr, mut last_op) = (0u16, 0u32, 0u32, 0u32, 0u8);
+    let mut report = TICKS.load(Ordering::Relaxed);
+    let mut sent_at_report = 0u32;
+    let mut sent = 0u32;
+    vcp.mark("spilink: ready");
+    loop {
+        for (i, b) in tx.payload().iter_mut().enumerate() {
+            *b = (seq as u8).wrapping_add(i as u8);
+        }
+        tx.seal(spi::KIND_TEST, last_op, seq, cmds, aborts);
+        link.arm(tx, rx);
+        link.drdy(true);
+        // A transfer that starts and ends short of FRAME is dropped and the same seq re-sent.
+        let ok = loop {
+            if link.done() {
+                break true;
+            }
+            if link.received() > 0 && link.idle() {
+                cortex_m::asm::delay(64_000); // 1 ms: NSS really released, not a glitch
+                if link.idle() && !link.done() {
+                    break false;
+                }
+            }
+        };
+        link.drdy(false);
+        if link.overrun() {
+            ovr += 1;
+        }
+        if ok {
+            let mut parser = CmdParser::new();
+            if let Some((op, _arg)) = rx[..6].iter().find_map(|&b| parser.feed(b)) {
+                cmds += 1;
+                last_op = op;
+            }
+            seq = seq.wrapping_add(1);
+            sent += 1;
+        } else {
+            aborts += 1;
+        }
+        let now = TICKS.load(Ordering::Relaxed);
+        if now.wrapping_sub(report) >= 500 {
+            let mut l = tsbk::Line { buf: [0; 192], len: 0 };
+            let fps = (sent - sent_at_report) * 100 / now.wrapping_sub(report);
+            let _ = write!(l, "spilink: sent={} fps={} cmds={} aborts={} ovr={}", sent, fps, cmds, aborts, ovr);
+            vcp.mark(core::str::from_utf8(&l.buf[..l.len]).unwrap_or("?"));
+            (report, sent_at_report) = (now, sent);
+        }
+    }
+}
+
 #[embassy_executor::main]
 async fn main(spawner: Spawner) {
     let p = unsafe { pac::Peripherals::steal() };
@@ -333,6 +393,11 @@ async fn main(spawner: Spawner) {
     cp.SYST.clear_current();
     cp.SYST.enable_interrupt();
     cp.SYST.enable_counter();
+
+    if cfg!(feature = "spilink") {
+        spawner.spawn(spilink(vcp).unwrap());
+        return;
+    }
 
     let radio = Radio::new();
     vcp.mark("radio: init ok");
