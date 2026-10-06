@@ -139,7 +139,7 @@ impl Link {
 pub const KIND_TAP: u8 = 1;
 const QDEPTH: usize = 3;
 
-/// Raw-tap frames queued for the master: kind TAP, flags = RX_MODE, aux0 = frames dropped
+/// Raw-tap frames queued for the master: kind TAP, flags = RX_MODE, aux0 = frames evicted
 /// (queue full), aux1 = 10 ms ticks at capture. Polled from the stream loop, so a finished
 /// transfer is noticed within one SysTick (10 ms); the tap fills a frame every 65 ms.
 pub struct Tap {
@@ -159,11 +159,20 @@ impl Tap {
         Self { q: [const { Frame::new() }; QDEPTH], rx: [0; FRAME], head: 0, len: 0, armed: false, stalled: false, seq: 0, dropped: 0, aborts: 0 }
     }
 
+    /// Full queue: evict the oldest frame not being transferred, so the master always gets the
+    /// freshest data (no stale backlog after an idle master). The gap shows in seq and aux0.
     pub fn push(&mut self, samples: &[u8], rx_mode: u8, ticks: u32) {
         if self.len == QDEPTH {
             self.dropped += 1;
-            self.seq = self.seq.wrapping_add(1); // the gap shows up in seq too
-            return;
+            if self.armed {
+                for k in 1..QDEPTH - 1 {
+                    let next = self.q[(self.head + k + 1) % QDEPTH].0;
+                    self.q[(self.head + k) % QDEPTH].0 = next;
+                }
+            } else {
+                self.head = (self.head + 1) % QDEPTH;
+            }
+            self.len -= 1;
         }
         let f = &mut self.q[(self.head + self.len) % QDEPTH];
         f.payload().copy_from_slice(&samples[..PAYLOAD]);
@@ -189,6 +198,13 @@ impl Tap {
                     self.armed = false;
                 }
                 self.stalled = !self.stalled;
+            } else if link.received() == 0 && self.len == QDEPTH {
+                // Master idle and queue full: retire the armed frame too, or it goes stale.
+                link.drdy(false);
+                self.head = (self.head + 1) % QDEPTH;
+                self.len -= 1;
+                self.dropped += 1;
+                self.armed = false;
             } else {
                 self.stalled = false;
             }
