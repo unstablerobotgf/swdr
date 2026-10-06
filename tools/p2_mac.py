@@ -5,12 +5,13 @@ usage: p2_mac.py IQ_FILE [IQ_FILE...] --nac HEX --sysid HEX --wacn HEX [--all]
 The scrambling seed comes from the control channel (NET_STATUS_BCAST / RFSS_STATUS_BCAST).
 H-DQPSK demod as in p2_sync.py; slots are numbered from the S-ISCH pairs (slots 2/3, 6/7,
 10/11), trying each superframe position and keeping the one whose ACCH CRCs pass. SACCH and
-FACCH are checked with CRC-12 on the systematic bits (no Reed-Solomon correction yet).
+FACCH are corrected with the punctured RS(63,35) (rs63.py) and checked with CRC-12.
 Prints MAC PDU types and Group Voice Channel User (talkgroup, source) messages.
 """
 import argparse
 import numpy as np
 import p2_sync
+import rs63
 
 BURST = 180  # dibits per timeslot, counted from the ISCH
 # DUID (8,4) codewords, value in the high nibble; decoded to the nearest within 1 bit.
@@ -71,20 +72,29 @@ def describe(pdu):
     return s
 
 
-def decode(path, xm):
+def decode(path, xm, rs=True):
     dib, off, err, dur = p2_sync.dibits(path, 31250.0, 6000.0)
     bits = np.unpackbits(dib[:, None], axis=1)[:, 6:].reshape(-1)
     win = np.lib.stride_tricks.sliding_window_view(bits, 40)[::2]
     hits = set(np.where((win != p2_sync.SYNC_BITS).sum(1) <= 4)[0].tolist())
-    pairs = [h for h in sorted(hits) if h + BURST in hits]
+    pairs = [h for h in sorted(hits) if h + BURST in hits and h - BURST not in hits]
     if not pairs:
         return err, None, []
-    anchor = pairs[0]
+    # Re-anchor the slot grid at every S-ISCH pair, so a timing slip only costs the slots up
+    # to the next pair. Pairs sit 4 slots (720 symbols) apart: slots 2, 6, 10, 2, ...
+    units = []
+    for i, h in enumerate(pairs):
+        nxt = pairs[i + 1] if i + 1 < len(pairs) else len(dib)
+        steps = round((h - pairs[0]) / (4 * BURST))
+        for k in range(4 * max(1, round((nxt - h) / (4 * BURST)))):
+            pos = h + k * BURST
+            if pos + BURST <= min(nxt, len(dib)) or (k < 4 and pos + BURST <= len(dib)):
+                units.append((pos, 4 * steps + k))
     best = (-1, None, [])
     for base in (2, 6, 10):
         res, good = [], 0
-        for pos in range(anchor % BURST, len(dib) - BURST, BURST):
-            slot = (base + (pos - anchor) // BURST) % 12
+        for pos, rel in units:
+            slot = (base + rel) % 12
             burst = dib[pos + 10:pos + BURST]
             d = duid(burst)
             if d not in SACCH and d not in FACCH:
@@ -92,16 +102,34 @@ def decode(path, xm):
                 continue
             scr = SACCH.get(d, FACCH.get(d))
             b = burst ^ xm[slot * BURST:slot * BURST + 170] if scr else burst
-            fast = d in FACCH
-            x = acch_bits(b, fast)
-            n = 144 if fast else 168
-            ok = crc12(x[:n]) == int("".join(map(str, x[n:n + 12])), 2)
-            good += ok
-            pdu = bytes(int("".join(map(str, x[i:i + 8])), 2) for i in range(0, n, 8))
-            res.append((pos, slot, d, describe(pdu) if ok else None))
+            pdu = acch_decode(b, d in FACCH, rs)
+            good += pdu is not None
+            res.append((pos, slot, d, describe(pdu) if pdu is not None else None))
         if good > best[0]:
             best = (good, base, res)
     return err, best[1], best[2]
+
+
+# Hexbit layout of the punctured RS(63,35): first codeword position, received bits, data bits.
+# The leading positions are shortened (always zero); the trailing ones are punctured parity.
+ACCH = {False: (5, 312, 168, range(57, 63)), True: (9, 270, 144, range(54, 63))}
+
+
+def acch_decode(b, fast, rs=True):
+    """MAC PDU bytes of a SACCH/FACCH burst if its CRC-12 passes (after RS correction), else None."""
+    x = acch_bits(b, fast)
+    j0, nb, n, punct = ACCH[fast]
+    if rs:
+        hb = [0] * 63
+        for i in range(0, nb, 6):
+            hb[j0 + i // 6] = int("".join(map(str, x[i:i + 6])), 2)
+        out, _ = rs63.decode(hb, punct)
+        if out is None:
+            return None
+        x = [(v >> (5 - k)) & 1 for v in out[j0:j0 + (n + 12) // 6] for k in range(6)]
+    if crc12(x[:n]) != int("".join(map(str, x[n:n + 12])), 2):
+        return None
+    return bytes(int("".join(map(str, x[i:i + 8])), 2) for i in range(0, n, 8))
 
 
 def main():
@@ -111,10 +139,11 @@ def main():
     ap.add_argument("--sysid", required=True)
     ap.add_argument("--wacn", required=True)
     ap.add_argument("--all", action="store_true", help="print every CRC-good PDU, not just new talkgroup lines")
+    ap.add_argument("--no-rs", action="store_true", help="CRC on the received bits only")
     a = ap.parse_args()
     xm = scrambler(int(a.nac, 16), int(a.sysid, 16), int(a.wacn, 16))
     for path in a.files:
-        err, base, res = decode(path, xm)
+        err, base, res = decode(path, xm, not a.no_rs)
         name = path.replace("\\", "/").split("/")[-1]
         if base is None:
             print(f"{name}: level err {err:.3f}, no S-ISCH pair (no slot lock)")
