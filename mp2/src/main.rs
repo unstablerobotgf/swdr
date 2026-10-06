@@ -6,9 +6,14 @@
 //! Kind-2 (I/Q) frames go to --iq as interleaved u8 offset-binary I/Q; with --demod cqpsk they
 //! are also CQPSK-demodulated (Fs from the frame's rate_exp) into the same decoder.
 //! --input FILE.u8 [--fs 31250] replays a recorded I/Q file through --demod instead of the link.
+//! --hop TG|any --cc HZ [--dwell 4] [--cooldown 20] [--hopdir DIR]: with --demod cqpsk on the
+//! control channel, follow a group grant to its voice channel, record --dwell s of I/Q there to
+//! DIR/hop_N_tgT_HZ.u8, then return to --cc. --ppm corrects every retune for the WL33 crystal
+//! (the firmware's AFC held -1005 Hz at 851.975 MHz, i.e. about -1.18 ppm).
 #[path = "../../firmware/src/bch.rs"]
 mod bch;
 mod cqpsk;
+mod hop;
 mod link;
 #[path = "../../firmware/src/p25.rs"]
 #[allow(dead_code)]
@@ -24,13 +29,14 @@ fn arg<T: std::str::FromStr>(args: &[String], name: &str, default: T) -> T {
 }
 
 /// Decode freq-tap-like samples, printing TSBKs as `unix_time	line`; returns how many.
-fn decode(dec: &mut p25::Decoder, idens: &mut tsbk::Idens, samples: &[i8]) -> u64 {
+fn decode(dec: &mut p25::Decoder, idens: &mut tsbk::Idens, samples: &[i8], got: &mut Vec<[u8; 12]>) -> u64 {
     let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs_f64();
     let mut o = std::io::stdout().lock();
     let mut n = 0;
     dec.push(samples, &mut |t| {
         let l = tsbk::format(t.nac, &t.bytes, t.trellis_errs, t.nid_errs, idens);
         let _ = writeln!(o, "{:.3}	{}", now, String::from_utf8_lossy(&l.buf[..l.len]));
+        got.push(t.bytes);
         n += 1;
     });
     let _ = o.flush();
@@ -67,7 +73,7 @@ fn main() -> std::io::Result<()> {
         for chunk in data.chunks(1024) {
             tapbuf.clear();
             d.push(chunk, &mut tapbuf);
-            n += decode(&mut dec, &mut idens, &tapbuf);
+            n += decode(&mut dec, &mut idens, &tapbuf, &mut Vec::new());
         }
         eprintln!(
             "swdr-tap: {path}: {:.1}s of I/Q in {:.2}s, {} symbols, carrier {:+.0} Hz, level err {:.3}, tsbk={n} syncs={} nid_rej={}",
@@ -75,6 +81,26 @@ fn main() -> std::io::Result<()> {
         );
         return Ok(());
     }
+    // Hop test state. A retune leaves ~1 frame of the old channel in flight, so skip 3 after each.
+    let hop_tg = args.iter().position(|a| a == "--hop").and_then(|i| args.get(i + 1)).cloned();
+    let cc_hz: u32 = arg(&args, "--cc", 851_975_000);
+    let ppm: f64 = arg(&args, "--ppm", 0.0);
+    let lo = |hz: u32| (hz as f64 * (1.0 + ppm * 1e-6)).round() as u32;
+    let (dwell, cooldown): (f64, f64) = (arg(&args, "--dwell", 4.0), arg(&args, "--cooldown", 20.0));
+    let hopdir: String = arg(&args, "--hopdir", "/root/hops".to_string());
+    if hop_tg.is_some() {
+        std::fs::create_dir_all(&hopdir)?;
+    }
+    struct Voice {
+        until: Instant,
+        file: std::fs::File,
+        tg: u32,
+        hz: u32,
+        frames: u64,
+        sum2: f64,
+    }
+    let (mut voice, mut skip, mut hops, mut last_hop): (Option<Voice>, u32, u32, Option<Instant>) = (None, 0, 0, None);
+    let mut got: Vec<[u8; 12]> = Vec::new();
     let started = Instant::now();
     let (mut iq_frames, mut xfers) = (0u64, 0u64);
     let mut link = link::Link::open("/dev/spidev0.0", "/dev/gpiochip9", 0, hz)?;
@@ -124,13 +150,43 @@ fn main() -> std::io::Result<()> {
             if let Some(w) = iq.as_mut() {
                 w.write_all(payload)?;
             }
+            if skip > 0 {
+                skip -= 1;
+                continue;
+            }
+            if let Some(v) = voice.as_mut() {
+                v.file.write_all(payload)?;
+                v.frames += 1;
+                v.sum2 += payload.iter().map(|&b| (b as f64 - 127.5).powi(2)).sum::<f64>() / payload.len() as f64;
+                if Instant::now() >= v.until {
+                    link.command(1, lo(cc_hz));
+                    eprintln!("swdr-tap: hop {hops} back to cc: tg={} {} Hz, {} frames, rms {:.1}", v.tg, v.hz, v.frames, (v.sum2 / v.frames as f64).sqrt());
+                    voice = None;
+                    skip = 3;
+                }
+                continue;
+            }
             if use_cqpsk {
                 let fs = 2_000_000.0 / (1u32 << (h.flags & 0xF)) as f32;
                 let d = demod.get_or_insert_with(|| cqpsk::Cqpsk::new(fs));
                 tapbuf.clear();
                 d.push(payload, &mut tapbuf);
-                let n = decode(&mut dec, &mut idens, &tapbuf);
+                got.clear();
+                let n = decode(&mut dec, &mut idens, &tapbuf, &mut got);
                 (tsbks, win_tsbk) = (tsbks + n, win_tsbk + n);
+                let free = cmds.is_empty() && last_hop.is_none_or(|t| t.elapsed().as_secs_f64() >= cooldown);
+                if let (Some(want), true) = (hop_tg.as_deref(), free) {
+                    let g = got.iter().filter_map(|b| hop::grant(b, &idens)).find(|g| want == "any" || want.parse() == Ok(g.tg));
+                    if let Some(g) = g.filter(|g| g.hz != cc_hz) {
+                        hops += 1;
+                        let path = format!("{hopdir}/hop_{hops}_tg{}_{}.u8", g.tg, g.hz);
+                        link.command(1, lo(g.hz));
+                        eprintln!("swdr-tap: hop {hops} tg={} ch={}-{} {} Hz -> {path}", g.tg, g.ch >> 12, g.ch & 0xFFF, g.hz);
+                        let until = Instant::now() + std::time::Duration::from_secs_f64(dwell);
+                        voice = Some(Voice { until, file: std::fs::File::create(path)?, tg: g.tg, hz: g.hz, frames: 0, sum2: 0.0 });
+                        (skip, last_hop) = (3, Some(Instant::now()));
+                    }
+                }
             }
             continue;
         }
