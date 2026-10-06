@@ -6,6 +6,7 @@
 //! may put a C5 command in the first 6 MOSI bytes. The TX FIFO cannot be flushed, so SPI1 is
 //! reset between frames; a short or aborted transfer then costs one frame, not the alignment.
 
+use core::sync::atomic::{AtomicBool, Ordering};
 use stm32wl33_pac as pac;
 
 pub const PAYLOAD: usize = 1024;
@@ -43,6 +44,19 @@ impl Frame {
     }
 }
 
+/// Set by the DMA IRQ when RX DMA has taken the last MOSI byte of the frame.
+static DONE: AtomicBool = AtomicBool::new(false);
+
+/// DMA IRQ: drop DRDY the moment the frame completes, so the master never sees a stale high.
+pub fn on_dma_irq() {
+    let p = unsafe { pac::Peripherals::steal() };
+    if p.dma.dma_isr().read().bits() & 1 << 9 != 0 {
+        p.dma.dma_ifcr().write(|w| unsafe { w.bits(0xF << 8) });
+        p.gpioa.bsrr().write(|w| unsafe { w.bits(1 << (5 + 16)) });
+        DONE.store(true, Ordering::Release);
+    }
+}
+
 pub struct Link {
     p: pac::Peripherals,
 }
@@ -66,6 +80,7 @@ impl Link {
         let dr = p.spi.spi_sspdr().as_ptr() as u32;
         p.dma.dma_cpar2().write(|w| unsafe { w.bits(dr) });
         p.dma.dma_cpar3().write(|w| unsafe { w.bits(dr) });
+        unsafe { cortex_m::peripheral::NVIC::unmask(pac::Interrupt::DMA) };
         Self { p }
     }
 
@@ -90,7 +105,8 @@ impl Link {
 
         d.dma_cmar3().write(|w| unsafe { w.bits(rx.as_mut_ptr() as u32) });
         d.dma_cndtr3().write(|w| unsafe { w.bits(FRAME as u32) });
-        d.dma_ccr3().write(|w| unsafe { w.bits(1 << 7 | 1) }); // MINC, EN; 8-bit both sides
+        DONE.store(false, Ordering::Release);
+        d.dma_ccr3().write(|w| unsafe { w.bits(1 << 7 | 1 << 1 | 1) }); // MINC, TCIE, EN; 8-bit both sides
         d.dma_cmar2().write(|w| unsafe { w.bits(tx.0.as_ptr() as u32) });
         d.dma_cndtr2().write(|w| unsafe { w.bits(FRAME as u32) });
         d.dma_ccr2().write(|w| unsafe { w.bits(1 << 7 | 1 << 4 | 1) }); // MINC, DIR mem->periph, EN
@@ -101,7 +117,7 @@ impl Link {
 
     /// The master has clocked a whole frame (every MOSI byte landed).
     pub fn done(&self) -> bool {
-        self.p.dma.dma_isr().read().bits() & 1 << 9 != 0 // TCIF3
+        DONE.load(Ordering::Acquire)
     }
 
     /// MOSI bytes received so far in the current transfer.
@@ -117,5 +133,76 @@ impl Link {
     /// RX overrun seen (DMA too slow for SCK).
     pub fn overrun(&self) -> bool {
         self.p.spi.spi_sspsr().read().bits() & 1 << 6 != 0
+    }
+}
+
+pub const KIND_TAP: u8 = 1;
+const QDEPTH: usize = 3;
+
+/// Raw-tap frames queued for the master: kind TAP, flags = RX_MODE, aux0 = frames dropped
+/// (queue full), aux1 = 10 ms ticks at capture. Polled from the stream loop, so a finished
+/// transfer is noticed within one SysTick (10 ms); the tap fills a frame every 65 ms.
+pub struct Tap {
+    q: [Frame; QDEPTH],
+    rx: [u8; FRAME],
+    head: usize,
+    len: usize,
+    armed: bool,
+    stalled: bool,
+    seq: u16,
+    pub dropped: u32,
+    pub aborts: u32,
+}
+
+impl Tap {
+    pub const fn new() -> Self {
+        Self { q: [const { Frame::new() }; QDEPTH], rx: [0; FRAME], head: 0, len: 0, armed: false, stalled: false, seq: 0, dropped: 0, aborts: 0 }
+    }
+
+    pub fn push(&mut self, samples: &[u8], rx_mode: u8, ticks: u32) {
+        if self.len == QDEPTH {
+            self.dropped += 1;
+            self.seq = self.seq.wrapping_add(1); // the gap shows up in seq too
+            return;
+        }
+        let f = &mut self.q[(self.head + self.len) % QDEPTH];
+        f.payload().copy_from_slice(&samples[..PAYLOAD]);
+        f.seal(KIND_TAP, rx_mode, self.seq, self.dropped, ticks);
+        self.seq = self.seq.wrapping_add(1);
+        self.len += 1;
+    }
+
+    /// Advance the transfer state; returns a command the master sent with the last frame.
+    pub fn poll(&mut self, link: &mut Link) -> Option<(u8, u32)> {
+        let mut cmd = None;
+        if self.armed {
+            if link.done() {
+                let mut parser = crate::uart::CmdParser::new();
+                cmd = self.rx[..6].iter().find_map(|&b| parser.feed(b));
+                self.head = (self.head + 1) % QDEPTH;
+                self.len -= 1;
+                self.armed = false;
+            } else if link.received() > 0 && link.idle() {
+                // Aborted short transfer: seen on two polls (>= 10 ms apart), so not a mid-frame gap.
+                if self.stalled {
+                    self.aborts += 1;
+                    self.armed = false;
+                }
+                self.stalled = !self.stalled;
+            } else {
+                self.stalled = false;
+            }
+            if self.armed {
+                return cmd;
+            }
+            link.drdy(false);
+        }
+        if self.len > 0 {
+            link.arm(&self.q[self.head], &mut self.rx);
+            link.drdy(true);
+            self.armed = true;
+            self.stalled = false;
+        }
+        cmd
     }
 }

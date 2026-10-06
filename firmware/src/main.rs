@@ -87,6 +87,13 @@ extern "C" fn MR_SUBG() {
     WAKE.signal(());
 }
 
+/// DMA channels 2/3 serve the SPI link; channel 1 (VCP) runs without interrupts.
+#[no_mangle]
+extern "C" fn DMA() {
+    spi::on_dma_irq();
+    WAKE.signal(());
+}
+
 /// 100 Hz heartbeat: commands must be serviced even when the radio has stopped (e.g. no PLL lock).
 #[cortex_m_rt::exception]
 fn SysTick() {
@@ -124,6 +131,9 @@ async fn stream(mut radio: Radio, mut vcp: Vcp, mut iq: UpChannel, mut cmd_rtt: 
     let (mut rf, mut rf_tick) = ((i16::MAX, i16::MIN, 0i32, 0i32, u8::MAX, 0u8), 0u32);
     // Software AFC: hardware AFC sits after the freq tap, so retune the LO from the sync fits instead.
     let (mut afc_on, mut afc_base, mut afc_tick) = (true, 0u32, 0u32);
+    // spitap: the decoder's input samples also go to the SPI master, frame for frame.
+    let mut link = if cfg!(feature = "spitap") { Some(spi::Link::new()) } else { None };
+    let tap = unsafe { &mut *core::ptr::addr_of_mut!(TAP) };
 
     if raw_mode == MODE_P25_DECODE {
         freq = option_env!("SWDR_P25_FREQ").and_then(|v| v.parse().ok()).unwrap_or(851_975_000);
@@ -163,6 +173,9 @@ async fn stream(mut radio: Radio, mut vcp: Vcp, mut iq: UpChannel, mut cmd_rtt: 
                     let line = tsbk::format(t.nac, &t.bytes, t.trellis_errs, t.nid_errs, &mut idens);
                     vcp.mark(core::str::from_utf8(&line.buf[..line.len]).unwrap_or("?"));
                 });
+                if link.is_some() {
+                    tap.push(&src[..PAYLOAD], 0b100, TICKS.load(Ordering::Relaxed));
+                }
                 continue;
             }
             // frames[cur] is never the one the UART DMA is reading.
@@ -223,12 +236,16 @@ async fn stream(mut radio: Radio, mut vcp: Vcp, mut iq: UpChannel, mut cmd_rtt: 
                 let afc = radio.rf_sample().2;
                 let lo = if afc_base == 0 { 0 } else { freq as i32 - afc_base as i32 };
                 let _ = write!(l, "SUM rf rssi={}/{}/{}dBm agc={}..{} hw_afc={} lo={:+}Hz", rf.0, rf.2 / rf.3, rf.1, rf.4, rf.5, afc, lo);
+                if link.is_some() {
+                    let _ = write!(l, " spi_drop={} spi_abort={}", tap.dropped, tap.aborts);
+                }
                 vcp.mark(core::str::from_utf8(&l.buf[..l.len]).unwrap_or("?"));
                 rf = (i16::MAX, i16::MIN, 0, 0, u8::MAX, 0);
             }
         }
 
-        let mut cmd = vcp.poll_cmd();
+        let spi_cmd = link.as_mut().and_then(|l| tap.poll(l));
+        let mut cmd = vcp.poll_cmd().or(spi_cmd);
         let mut b = [0u8; 1];
         while cmd.is_none() && cmd_rtt.read(&mut b) == 1 {
             cmd = rtt_cmd.feed(b[0]);
@@ -288,6 +305,7 @@ async fn stream(mut radio: Radio, mut vcp: Vcp, mut iq: UpChannel, mut cmd_rtt: 
     }
 }
 
+static mut TAP: spi::Tap = spi::Tap::new();
 static mut LINK_TX: spi::Frame = spi::Frame::new();
 static mut LINK_RX: [u8; spi::FRAME] = [0; spi::FRAME];
 

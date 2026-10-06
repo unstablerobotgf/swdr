@@ -82,6 +82,10 @@ fn main() -> anyhow::Result<()> {
     for (nac, b, e, ne) in &out {
         let l = tsbk::format(*nac, b, *e, *ne, &mut idens);
         let text = String::from_utf8_lossy(&l.buf[..l.len]).to_string();
+        // P25_LINES=1 prints every TSBK, for diffing against the on-board decoder's VCP lines.
+        if std::env::var_os("P25_LINES").is_some() {
+            println!("{text}");
+        }
         seen.entry(text.split_whitespace().nth(1).unwrap_or("").to_string()).or_insert(text);
     }
     if sd == 0.0 {

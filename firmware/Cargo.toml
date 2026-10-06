@@ -31,3 +31,5 @@ codegen-units = 1
 p25 = []
 # SPI1 slave link bring-up to the MP257F-DK: counting test frames, radio left off.
 spilink = []
+# P25 decoding, with the decoder's freq-tap input also streamed to the SPI master.
+spitap = ["p25"]
