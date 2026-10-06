@@ -9,6 +9,7 @@ pub const FRAME: usize = 1040;
 pub const HDR: usize = 16;
 pub const KIND_TEST: u8 = 0;
 pub const KIND_TAP: u8 = 1;
+pub const KIND_IQ: u8 = 2;
 
 const SPI_IOC_MESSAGE_1: libc::c_ulong = 0x4020_6B00;
 const GPIO_V2_GET_LINE_IOCTL: libc::c_ulong = 0xC250_B407;

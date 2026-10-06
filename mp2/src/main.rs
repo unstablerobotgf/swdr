@@ -1,7 +1,9 @@
 //! swdr-tap: read the WL33 freq-tap stream over SPI and decode P25 TSBKs on the DK, with the
 //! same decoder source the firmware runs. TSBK lines go to stdout as `unix_time\tline`
 //! (the swdr-p25 raw.log format); link and decode stats go to stderr.
-//! usage: swdr-tap [--hz 16000000] [--stats 30] [--dump FILE.i8]
+//! usage: swdr-tap [--hz 16000000] [--stats 30] [--secs N] [--dump FILE.i8] [--iq FILE.u8] [--cmd OP:ARG]...
+//! --cmd sends C5 commands to the WL33 over the link, one every 16 frames, in order.
+//! Kind-2 (I/Q) frames go to --iq as interleaved u8 offset-binary I/Q.
 #[path = "../../firmware/src/bch.rs"]
 mod bch;
 mod link;
@@ -26,6 +28,18 @@ fn main() -> std::io::Result<()> {
         Some(p) => Some(std::fs::File::create(p)?),
         None => None,
     };
+    let mut iq = match args.iter().position(|a| a == "--iq").and_then(|i| args.get(i + 1)) {
+        Some(p) => Some(std::fs::File::create(p)?),
+        None => None,
+    };
+    let secs: f64 = arg(&args, "--secs", f64::INFINITY);
+    let mut cmds: std::collections::VecDeque<(u8, u32)> = args
+        .windows(2)
+        .filter(|w| w[0] == "--cmd")
+        .filter_map(|w| w[1].split_once(':').and_then(|(o, a)| Some((o.parse().ok()?, a.parse().ok()?))))
+        .collect();
+    let started = Instant::now();
+    let (mut iq_frames, mut xfers) = (0u64, 0u64);
     let mut link = link::Link::open("/dev/spidev0.0", "/dev/gpiochip9", 0, hz)?;
     let mut dec = p25::Decoder::new();
     let mut idens = tsbk::Idens::new();
@@ -35,17 +49,25 @@ fn main() -> std::io::Result<()> {
     let (mut last_seq, mut drops0): (Option<u16>, Option<u32>) = (None, None);
     let (mut win_t, mut win_tsbk) = (Instant::now(), 0u64);
     eprintln!("swdr-tap: SPI {} MHz, stats every {} s", hz / 1_000_000, stats_s);
-    loop {
+    while started.elapsed().as_secs_f64() < secs {
+        // Paced on transfers, not good frames, so a bad header can't fire two commands back to back.
+        if xfers % 16 == 0 {
+            if let Some((op, a)) = cmds.pop_front() {
+                eprintln!("swdr-tap: cmd {op} {a}");
+                link.command(op, a);
+            }
+        }
         if !link.wait_ready(2000)? {
             eprintln!("swdr-tap: no DRDY for 2 s");
             continue;
         }
         let f = link.transfer()?;
+        xfers += 1;
         let Some(h) = link::Header::parse(f) else {
             bad += 1;
             continue;
         };
-        if h.kind != link::KIND_TAP {
+        if h.kind != link::KIND_TAP && h.kind != link::KIND_IQ {
             bad += 1;
             continue;
         }
@@ -60,6 +82,13 @@ fn main() -> std::io::Result<()> {
         drops0.get_or_insert(h.aux0);
         frames += 1;
         let payload = &f[link::HDR..];
+        if h.kind == link::KIND_IQ {
+            iq_frames += 1;
+            if let Some(w) = iq.as_mut() {
+                w.write_all(payload)?;
+            }
+            continue;
+        }
         if let Some(d) = dump.as_mut() {
             d.write_all(payload)?;
         }
@@ -83,4 +112,6 @@ fn main() -> std::io::Result<()> {
             (win_t, win_tsbk) = (Instant::now(), 0);
         }
     }
+    eprintln!("swdr-tap: done: frames={frames} iq_frames={iq_frames} bad={bad} gaps={gaps} lost={lost} tsbk={tsbks}");
+    Ok(())
 }

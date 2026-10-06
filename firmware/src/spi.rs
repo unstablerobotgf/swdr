@@ -137,9 +137,11 @@ impl Link {
 }
 
 pub const KIND_TAP: u8 = 1;
+/// Narrowed I/Q, 512 complex u8 offset-binary pairs; flags = rate_exp | shift << 4.
+pub const KIND_IQ: u8 = 2;
 const QDEPTH: usize = 3;
 
-/// Raw-tap frames queued for the master: kind TAP, flags = RX_MODE, aux0 = frames evicted
+/// Frames queued for the master (kind TAP or IQ), aux0 = frames evicted
 /// (queue full), aux1 = 10 ms ticks at capture. Polled from the stream loop, so a finished
 /// transfer is noticed within one SysTick (10 ms); the tap fills a frame every 65 ms.
 pub struct Tap {
@@ -161,7 +163,7 @@ impl Tap {
 
     /// Full queue: evict the oldest frame not being transferred, so the master always gets the
     /// freshest data (no stale backlog after an idle master). The gap shows in seq and aux0.
-    pub fn push(&mut self, samples: &[u8], rx_mode: u8, ticks: u32) {
+    pub fn push(&mut self, kind: u8, flags: u8, data: &[u8], ticks: u32) {
         if self.len == QDEPTH {
             self.dropped += 1;
             if self.armed {
@@ -175,8 +177,8 @@ impl Tap {
             self.len -= 1;
         }
         let f = &mut self.q[(self.head + self.len) % QDEPTH];
-        f.payload().copy_from_slice(&samples[..PAYLOAD]);
-        f.seal(KIND_TAP, rx_mode, self.seq, self.dropped, ticks);
+        f.payload().copy_from_slice(&data[..PAYLOAD]);
+        f.seal(kind, flags, self.seq, self.dropped, ticks);
         self.seq = self.seq.wrapping_add(1);
         self.len += 1;
     }

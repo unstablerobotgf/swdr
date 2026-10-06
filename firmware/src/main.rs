@@ -174,7 +174,7 @@ async fn stream(mut radio: Radio, mut vcp: Vcp, mut iq: UpChannel, mut cmd_rtt: 
                     vcp.mark(core::str::from_utf8(&line.buf[..line.len]).unwrap_or("?"));
                 });
                 if link.is_some() {
-                    tap.push(&src[..PAYLOAD], 0b100, TICKS.load(Ordering::Relaxed));
+                    tap.push(spi::KIND_TAP, 0b100, &src[..PAYLOAD], TICKS.load(Ordering::Relaxed));
                 }
                 continue;
             }
@@ -185,6 +185,10 @@ async fn stream(mut radio: Radio, mut vcp: Vcp, mut iq: UpChannel, mut cmd_rtt: 
             } else {
                 narrow(src, frames[cur].payload(), shift);
                 frames[cur].seal(seq, rate, shift as u8);
+            }
+            if link.is_some() {
+                let (kind, flags) = if p25 { (spi::KIND_TAP, raw_mode) } else { (spi::KIND_IQ, rate | (shift as u8) << 4) };
+                tap.push(kind, flags, &frames[cur].bytes()[8..], TICKS.load(Ordering::Relaxed));
             }
             // NoBlockSkip writes whole frames or nothing, so the RTT stream stays frame-aligned.
             if iq.write(frames[cur].bytes()) == 0 {
