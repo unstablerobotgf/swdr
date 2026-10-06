@@ -1,0 +1,6 @@
+# Static binary for the DK (NixOS aarch64), linked with rust-lld so no cross toolchain is needed.
+[build]
+target = "aarch64-unknown-linux-musl"
+
+[target.aarch64-unknown-linux-musl]
+linker = "rust-lld"

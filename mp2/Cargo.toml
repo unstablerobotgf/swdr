@@ -1,0 +1,17 @@
+[package]
+name = "swdr-mp2"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "STM32MP257F-DK side of the swdr SPI link: frame reader and P25 decoder"
+
+[dependencies]
+libc = "0.2"
+
+[profile.release]
+opt-level = 3
+lto = true
+
+[[bin]]
+name = "swdr-tap"
+path = "src/main.rs"
