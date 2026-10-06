@@ -8,7 +8,7 @@
 //! --input FILE.u8 [--fs 31250] replays a recorded I/Q file through --demod instead of the link.
 //! --hop TG|any --cc HZ [--dwell 4] [--cooldown 20] [--hopdir DIR]: with --demod cqpsk on the
 //! control channel, follow a group grant to its voice channel, record --dwell s of I/Q there to
-//! DIR/hop_N_tgT_HZ.u8, then return to --cc. --ppm corrects every retune for the WL33 crystal
+//! DIR/hop_N_tgT_HZ.u8 (--hopdir none: no recording), then return to --cc. --ppm corrects every retune for the WL33 crystal
 //! (the firmware's AFC held -1005 Hz at 851.975 MHz, i.e. about -1.18 ppm).
 //! With --nac --sysid --wacn (hex, from the CC's NET/RFSS_STATUS) each hop decodes the Phase 2
 //! MAC live and follows the call: --dwell is the acquisition window, each MAC_ACTIVE/PTT for the
@@ -53,7 +53,7 @@ fn hexarg(args: &[String], name: &str) -> Option<u32> {
 }
 
 fn p2_line(p: &p2::Pdu) -> String {
-    let mut s = format!("P2 slot={:2} {} {:?}", p.slot, if p.fast { "FACCH" } else { "SACCH" }, p.kind);
+    let mut s = format!("P2 slot={:2} lch={} {} {:?}", p.slot, p.lch, if p.fast { "FACCH" } else { "SACCH" }, p.kind);
     match (p.tg, p.src) {
         (Some(t), Some(r)) => s += &format!(" tg={t} src={r}"),
         _ => s += &format!(" mco=0x{:02x}", p.mco),
@@ -131,15 +131,17 @@ fn main() -> std::io::Result<()> {
     let lo = |hz: u32| (hz as f64 * (1.0 + ppm * 1e-6)).round() as u32;
     let (dwell, cooldown): (f64, f64) = (arg(&args, "--dwell", 4.0), arg(&args, "--cooldown", 20.0));
     let hopdir: String = arg(&args, "--hopdir", "/root/hops".to_string());
-    if hop_tg.is_some() {
+    let record = hopdir != "none";
+    if hop_tg.is_some() && record {
         std::fs::create_dir_all(&hopdir)?;
     }
     struct Voice {
         until: Instant,
         start: Instant,
-        file: std::fs::File,
+        file: Option<std::fs::File>,
         tg: u32,
         hz: u32,
+        lch: u8,
         frames: u64,
         sum2: f64,
         p2: Option<(cqpsk::Cqpsk, p2::P2)>,
@@ -206,7 +208,9 @@ fn main() -> std::io::Result<()> {
                 continue;
             }
             if let Some(v) = voice.as_mut() {
-                v.file.write_all(payload)?;
+                if let Some(f) = v.file.as_mut() {
+                    f.write_all(payload)?;
+                }
                 v.frames += 1;
                 v.sum2 += payload.iter().map(|&b| (b as f64 - 127.5).powi(2)).sum::<f64>() / payload.len() as f64;
                 if let Some((d, p)) = v.p2.as_mut() {
@@ -217,7 +221,8 @@ fn main() -> std::io::Result<()> {
                     let now_s = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs_f64();
                     for x in &pdus {
                         println!("{now_s:.3}	hop={hops} {} Hz {}", v.hz, p2_line(x));
-                        if x.tg != Some(v.tg as u16) {
+                        // Only our timeslot's signalling; the other slot carries a different call.
+                        if x.tg != Some(v.tg as u16) || x.lch != v.lch {
                             continue;
                         }
                         v.seen += 1;
@@ -262,14 +267,14 @@ fn main() -> std::io::Result<()> {
                         hops += 1;
                         let path = format!("{hopdir}/hop_{hops}_tg{}_{}.u8", g.tg, g.hz);
                         link.command(1, lo(g.hz));
-                        eprintln!("swdr-tap: hop {hops} tg={} ch={}-{} {} Hz -> {path}", g.tg, g.ch >> 12, g.ch & 0xFFF, g.hz);
+                        eprintln!("swdr-tap: hop {hops} tg={} ch={}-{} {} Hz slot {} -> {path}", g.tg, g.ch >> 12, g.ch & 0xFFF, g.hz, g.slot);
                         let until = Instant::now() + std::time::Duration::from_secs_f64(dwell);
                         let p2 = match ids {
                             (Some(n), Some(s), Some(w)) => Some((cqpsk::Cqpsk::with_rate(fs, cqpsk::P2_SYM), p2::P2::new(n as u16, s as u16, w))),
                             _ => None,
                         };
                         let why = if p2.is_some() { "no MAC for tg in acquisition window" } else { "dwell" };
-                        voice = Some(Voice { until, start: Instant::now(), file: std::fs::File::create(path)?, tg: g.tg, hz: g.hz, frames: 0, sum2: 0.0, p2, seen: 0, why });
+                        voice = Some(Voice { until, start: Instant::now(), file: if record { Some(std::fs::File::create(&path)?) } else { None }, tg: g.tg, hz: g.hz, lch: g.slot, frames: 0, sum2: 0.0, p2, seen: 0, why });
                         (skip, last_hop) = (3, Some(Instant::now()));
                     }
                 }

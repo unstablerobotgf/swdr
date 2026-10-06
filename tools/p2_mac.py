@@ -17,6 +17,8 @@ BURST = 180  # dibits per timeslot, counted from the ISCH
 # DUID (8,4) codewords, value in the high nibble; decoded to the nearest within 1 bit.
 DUID_CW = [0x00, 0x17, 0x2E, 0x39, 0x4B, 0x5C, 0x65, 0x72, 0x8D, 0x9A, 0xA3, 0xB4, 0xC6, 0xD1, 0xE8, 0xFF]
 SACCH, FACCH = {3: True, 12: False}, {9: True, 15: False}  # duid -> scrambled
+# Superframe slot -> logical channel (slots 10 and 11 swapped); the grant's channel-number LSB.
+LCH = [0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 1, 0]
 MAC = {0: "SIGNAL", 1: "PTT", 2: "END_PTT", 3: "IDLE", 4: "ACTIVE", 6: "HANGTIME"}
 
 
@@ -156,7 +158,7 @@ def main():
         for pos, slot, d, m in res:
             if m and (a.all or ("tg=" in m and m not in seen)):
                 seen.add(m)
-                print(f"   t={pos / 6000:6.3f}s slot {slot:2d} {'FACCH' if d in FACCH else 'SACCH'}: {m}")
+                print(f"   t={pos / 6000:6.3f}s slot {slot:2d} lch {LCH[slot]} {'FACCH' if d in FACCH else 'SACCH'}: {m}")
 
 
 if __name__ == "__main__":

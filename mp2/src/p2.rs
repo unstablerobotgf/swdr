@@ -8,6 +8,8 @@ use crate::rs63;
 
 const BURST: u64 = 180;
 const SYNC: u64 = 0x575D_57F7_FF;
+/// Superframe slot -> logical channel; slots 10 and 11 are swapped.
+const LCH: [u8; 12] = [0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 1, 0];
 const DUID_CW: [u8; 16] = [0x00, 0x17, 0x2E, 0x39, 0x4B, 0x5C, 0x65, 0x72, 0x8D, 0x9A, 0xA3, 0xB4, 0xC6, 0xD1, 0xE8, 0xFF];
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -28,6 +30,8 @@ pub struct Pdu {
     pub src: Option<u32>,
     pub mco: u8,
     pub slot: u8,
+    /// Logical channel (0/1) of the burst; matches the grant's channel-number LSB.
+    pub lch: u8,
     pub fast: bool,
 }
 
@@ -111,7 +115,7 @@ fn parse(p: &[u8], slot: u8, fast: bool) -> Pdu {
     } else if matches!(kind, Kind::Idle | Kind::Active | Kind::Hangtime) && p[1] == 0x01 {
         (tg, src) = (Some(be(3, 2) as u16), Some(be(5, 3))); // Group Voice Channel User (abbreviated)
     }
-    Pdu { kind, tg, src, mco: p[1], slot, fast }
+    Pdu { kind, tg, src, mco: p[1], slot, lch: LCH[slot as usize], fast }
 }
 
 pub struct P2 {

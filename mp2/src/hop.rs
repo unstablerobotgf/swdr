@@ -7,6 +7,8 @@ pub struct Grant {
     pub tg: u32,
     pub ch: u32,
     pub hz: u32,
+    /// Phase 2 logical channel (TDMA timeslot) the call is on.
+    pub slot: u8,
 }
 
 /// GRP_VCH_GRANT (0x00) or the first slot of GRP_VCH_GRANT_UPD (0x02), standard MFID only.
@@ -19,5 +21,5 @@ pub fn grant(b: &[u8; 12], idens: &Idens) -> Option<Grant> {
         0x02 => (field(b, 48, 16), field(b, 64, 16)),
         _ => return None,
     };
-    Some(Grant { tg, ch, hz: idens.freq(ch)? })
+    Some(Grant { tg, ch, hz: idens.freq(ch)?, slot: idens.slot(ch)? })
 }

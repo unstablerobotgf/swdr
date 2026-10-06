@@ -35,6 +35,12 @@ impl Idens {
         Self([None; 16])
     }
 
+    /// TDMA timeslot a channel number selects (0 on FDMA idens).
+    pub fn slot(&self, ch: u32) -> Option<u8> {
+        let i = self.0[(ch >> 12) as usize & 0xF]?;
+        Some(((ch & 0xFFF) % i.slots.max(1) as u32) as u8)
+    }
+
     pub fn freq(&self, ch: u32) -> Option<u32> {
         let i = self.0[(ch >> 12) as usize & 0xF]?;
         Some(i.base_hz + i.step_hz * ((ch & 0xFFF) / i.slots.max(1) as u32))
