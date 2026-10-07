@@ -106,6 +106,9 @@ fn main() -> std::io::Result<()> {
             for x in &pdus {
                 println!("{}", p2_line(x));
             }
+            for e in &p.ess {
+                println!("ESS lch={} algid=0x{:02x}", e.lch, e.alg);
+            }
             // --wav OUT [--lch N]: synthesise that logical channel's voice (vocoder builds only).
             if let Some(wav) = args.iter().position(|a| a == "--wav").and_then(|i| args.get(i + 1)) {
                 let lch: u8 = arg(&args, "--lch", 0);
@@ -269,6 +272,14 @@ fn main() -> std::io::Result<()> {
                             }
                             p2::Kind::EndPtt => (v.until, v.why) = (Instant::now(), "END_PTT"),
                             _ => {}
+                        }
+                    }
+                    for e in p.ess.drain(..) {
+                        if e.lch == v.lch {
+                            if v.alg != Some(e.alg) {
+                                eprintln!("swdr-tap: hop {hops} tg={} ESS algid 0x{:02x}", v.tg, e.alg);
+                            }
+                            v.alg = Some(e.alg);
                         }
                     }
                     #[cfg(feature = "vocoder")]

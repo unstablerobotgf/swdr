@@ -12,6 +12,7 @@ import argparse
 import collections
 import numpy as np
 import p2_mac
+import rs63
 
 # Voice frame bit k (0..71, from the 36 dibits, MSB of each dibit first) -> (codeword, bit),
 # bit 0 being the LSB of that codeword (TIA-102.BBAC voice codeword interleave).
@@ -86,6 +87,38 @@ def frame(dibits):
     return (e0 + e1, (u0, u1, c[2], c[3])), c
 
 
+def ess(slots):
+    """Encryption sync per voice superframe on one logical channel. A channel's superframe is six
+    bursts, 4V 4V SACCH 4V 4V 2V; the 2V (offset 84, skipping the DUID dibit at 132) carries 28
+    hexbits of ESS-A and the four 4V bursts 5, 4, 2 and 1 bursts before it carry 4 hexbits of
+    ESS-B each (offset 84), as RS(63,35) shortened to [19 zero | 16 ESS-B | 28 ESS-A]. A missing
+    4V becomes four erasures. Yields (algid, keyid, mi, corrected) or None per superframe."""
+    hexbit = lambda d: (int(d[0]) << 4) | (int(d[1]) << 2) | int(d[2])
+    for t, (d, b) in enumerate(slots):
+        if d != 6 or t < 5:
+            continue
+        cw, era = [0] * 19, []
+        for k, back in enumerate((5, 4, 2, 1)):
+            d4, b4 = slots[t - back]
+            if d4 == 0:
+                cw += [hexbit(b4[84 + 3 * i:87 + 3 * i]) for i in range(4)]
+            else:
+                era += range(19 + 4 * k, 23 + 4 * k)
+                cw += [0] * 4
+        cw += [hexbit(b[j:j + 3]) for j in (84 + 3 * i + (1 if i > 15 else 0) for i in range(28))]
+        out, n = rs63.decode(cw, era)
+        if out is None:
+            yield None
+            continue
+        e = out[19:35]
+        alg = (e[0] << 2) | (e[1] >> 4)
+        key = ((e[1] & 15) << 12) | (e[2] << 6) | e[3]
+        mi = bytearray()
+        for j in range(4, 16, 4):
+            mi += bytes([(e[j] << 2) | (e[j + 1] >> 4), ((e[j + 1] & 15) << 4) | (e[j + 2] >> 2), ((e[j + 2] & 3) << 6) | e[j + 3]])
+        yield alg, key, bytes(mi), n
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("file")
@@ -102,12 +135,16 @@ def main():
         print("no slot lock")
         return
     stats = collections.defaultdict(collections.Counter)
+    per_lch = collections.defaultdict(list)
     out = open(a.out, "wb") if a.out else None
     for pos, slot, d, _ in res:
         lch = p2_mac.LCH[slot]
-        if d not in VOICE or (a.lch is not None and lch != a.lch):
+        if a.lch is not None and lch != a.lch:
             continue
         b = dib[pos + 10:pos + 180] ^ xm[slot * 180:slot * 180 + 170]
+        per_lch[lch].append((d, b))
+        if d not in VOICE:
+            continue
         for s in VOICE[d]:
             r, c = frame(b[s:s + 36])
             stats[lch]["frames"] += 1
@@ -120,6 +157,8 @@ def main():
                 out.write(v.to_bytes(9, "big"))
     for lch in sorted(stats):
         print(f"lch {lch}: {dict(sorted(stats[lch].items()))}")
+        for r in ess(per_lch[lch]):
+            print(f"   ESS: " + ("uncorrectable" if r is None else f"algid 0x{r[0]:02x} keyid 0x{r[1]:04x} mi {r[2].hex()} ({r[3]} corrected)"))
 
 
 if __name__ == "__main__":

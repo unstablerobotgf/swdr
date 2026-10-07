@@ -47,6 +47,14 @@ pub struct Pdu {
     pub alg: Option<u8>,
 }
 
+/// Encryption sync from one voice superframe on a logical channel.
+#[derive(Debug, Clone, Copy)]
+pub struct Ess {
+    pub lch: u8,
+    pub alg: u8,
+    pub key: u16,
+}
+
 /// One 20 ms AMBE+2 3600x2450 frame as codewords c0 (24), c1 (23), c2 (11), c3 (14).
 #[derive(Debug, Clone, Copy)]
 pub struct VoiceFrame {
@@ -153,11 +161,15 @@ pub struct P2 {
     pub acch_good: u64,
     /// Voice frames from 4V/2V bursts, appended as they are cut; callers drain it.
     pub voice: Vec<VoiceFrame>,
+    /// ESS decoded at each 2V burst; callers drain it.
+    pub ess: Vec<Ess>,
+    /// Last bursts per logical channel: DUID (or None) and descrambled 4V bits for ESS-B.
+    recent: [std::collections::VecDeque<(Option<u8>, Option<[u8; 12]>)>; 2],
 }
 
 impl P2 {
     pub fn new(nac: u16, sysid: u16, wacn: u32) -> Self {
-        Self { xm: scrambler(nac, sysid, wacn), hist: Vec::new(), hist0: 0, n: 0, acc: 0, hits: Vec::new(), anchor: None, next: (0, 0), good: [0; 3], slots: 0, acch: 0, acch_good: 0, voice: Vec::new() }
+        Self { xm: scrambler(nac, sysid, wacn), hist: Vec::new(), hist0: 0, n: 0, acc: 0, hits: Vec::new(), anchor: None, next: (0, 0), good: [0; 3], slots: 0, acch: 0, acch_good: 0, voice: Vec::new(), ess: Vec::new(), recent: Default::default() }
     }
 
     pub fn locked(&self) -> bool {
@@ -219,9 +231,63 @@ impl P2 {
         }
     }
 
+    /// The channel's superframe is 4V 4V SACCH 4V 4V 2V: ESS-B comes from the 4V bursts 5, 4, 2
+    /// and 1 back (a missing one becomes four erasures), ESS-A from this 2V, as RS(63,35)
+    /// shortened to [19 zero | 16 ESS-B | 28 ESS-A].
+    fn ess_decode(&self, lch: usize, b: &[u8]) -> Option<Ess> {
+        let h = &self.recent[lch];
+        if h.len() < 6 {
+            return None;
+        }
+        let hex = |d: &[u8]| (d[0] << 4) | (d[1] << 2) | d[2];
+        let mut cw = [0u8; 63];
+        let mut era = Vec::new();
+        for (k, back) in [5usize, 4, 2, 1].into_iter().enumerate() {
+            match h[h.len() - 1 - back] {
+                (Some(0), Some(e)) => {
+                    for i in 0..4 {
+                        cw[19 + 4 * k + i] = hex(&e[3 * i..3 * i + 3]);
+                    }
+                }
+                _ => era.extend(19 + 4 * k..23 + 4 * k),
+            }
+        }
+        for i in 0..28 {
+            let j = 84 + 3 * i + (i > 15) as usize; // skip the DUID dibit at 132
+            cw[35 + i] = hex(&b[j..j + 3]);
+        }
+        rs63::decode(&mut cw, &era)?;
+        let e = &cw[19..35];
+        Some(Ess { lch: lch as u8, alg: (e[0] << 2) | (e[1] >> 4), key: (((e[1] & 15) as u16) << 12) | ((e[2] as u16) << 6) | e[3] as u16 })
+    }
+
     fn unit(&mut self, unit: &[u8], rel: i64, out: &mut Vec<Pdu>) {
         let burst = &unit[10..];
-        let Some(d) = duid(burst) else { return };
+        let d = duid(burst);
+        // Burst history per logical channel, on the best-supported superframe position.
+        let kb = (0..3).max_by_key(|&k| self.good[k]).unwrap();
+        let lch = LCH[((2 + 4 * kb as i64 + rel).rem_euclid(12)) as usize] as usize;
+        let mut ess_b = None;
+        if d == Some(0) && self.good[kb] > 0 {
+            let slot = ((2 + 4 * kb as i64 + rel).rem_euclid(12)) as usize;
+            let mut e = [0u8; 12];
+            for (i, v) in e.iter_mut().enumerate() {
+                *v = burst[84 + i] ^ self.xm[slot * BURST as usize + 84 + i];
+            }
+            ess_b = Some(e);
+        }
+        if self.recent[lch].len() == 6 {
+            self.recent[lch].pop_front();
+        }
+        self.recent[lch].push_back((d, ess_b));
+        let Some(d) = d else { return };
+        if d == 6 && self.good[kb] > 0 {
+            let slot = ((2 + 4 * kb as i64 + rel).rem_euclid(12)) as usize;
+            let b: Vec<u8> = burst.iter().zip(&self.xm[slot * BURST as usize..]).map(|(a, m)| a ^ m).collect();
+            if let Some(e) = self.ess_decode(lch, &b) {
+                self.ess.push(e);
+            }
+        }
         if d == 0 || d == 6 {
             // Voice is always scrambled; use the superframe position the ACCH CRCs settled on.
             let k = (0..3).max_by_key(|&k| self.good[k]).unwrap();
