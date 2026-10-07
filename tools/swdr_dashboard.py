@@ -141,9 +141,12 @@ table{width:100%;border-collapse:collapse;font-variant-numeric:tabular-nums}th,t
 td.n{text-align:right}.wrap{overflow-x:auto}.pill{display:inline-block;padding:1px 7px;border-radius:999px;font-size:12px;border:1px solid var(--line)}
 .clear{color:var(--good)}.enc{color:var(--crit)}.unk{color:var(--warn)}.bar{height:8px;background:var(--accent);border-radius:4px}
 .spark{display:flex;align-items:flex-end;gap:3px;height:36px;margin-top:6px}.spark div{flex:1;background:var(--accent);border-radius:2px 2px 0 0;min-height:1px;opacity:.85}
-audio{height:28px;max-width:220px}.dot{display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:6px;vertical-align:middle}
+button.play{border:1px solid var(--line);background:var(--card);color:var(--ink);border-radius:6px;padding:1px 9px;cursor:pointer;font:inherit}
+button.play.on{background:var(--accent);color:#fff;border-color:var(--accent)}
+#player{position:sticky;top:0;z-index:5;display:flex;gap:12px;align-items:center;margin-bottom:14px}#player audio{flex:1;min-width:0;height:34px}#nowplaying{white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:45%}.dot{display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:6px;vertical-align:middle}
 </style></head><body><main>
 <h1>swdr on mp2</h1><div class="sub" id="status">connecting...</div>
+<div class="card" id="player"><span id="nowplaying" style="color:var(--muted)">select a call to play</span><audio id="audio" controls preload="none"></audio></div>
 <div class="grid">
  <div class="card kpi"><div class="v" id="k_rate">-</div><div class="l">CC TSBK/s (60 s)</div><div class="spark" id="spark" title="TSBK/s per minute, last 10 min"></div></div>
  <div class="card kpi"><div class="v" id="k_hops">-</div><div class="l">calls followed (1 h)</div></div>
@@ -162,20 +165,27 @@ const esc=s=>String(s).replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",
 const tm=t=>new Date(t*1000).toLocaleTimeString([], {hour:"2-digit",minute:"2-digit",second:"2-digit"});
 const tgl=(tg,name)=>esc(tg)+(name?' <span style="color:var(--muted)">'+esc(name)+'</span>':'');
 const crypto=a=>a==="0x80"?'<span class="pill clear">clear</span>':(a&&a!=="-"?'<span class="pill enc">'+esc(a)+'</span>':'<span class="pill unk">unknown</span>');
-const player=f=>'<audio controls preload="none" src="/calls/'+encodeURIComponent(f)+'"></audio>';
-let playing=false;document.addEventListener("play",()=>playing=true,true);document.addEventListener("pause",()=>playing=false,true);
+// One persistent player outside the refreshed tables, so a refresh never interrupts playback.
+let current=null;
+const player=(f,label)=>'<button class="play'+(f===current?' on':'')+'" data-f="'+esc(f)+'" data-l="'+esc(label)+'">'+(f===current?'&#9646;&#9646;':'&#9654;')+'</button>';
+document.addEventListener("click",e=>{const b=e.target.closest("button.play");if(!b)return;const a=$("audio"),f=b.dataset.f;
+ if(f===current&&!a.paused){a.pause();return;}
+ if(f!==current){current=f;a.src="/calls/"+encodeURIComponent(f);$("nowplaying").textContent=b.dataset.l;$("nowplaying").style.color="var(--ink)";}
+ a.play();marks();});
+const marks=()=>document.querySelectorAll("button.play").forEach(b=>{const on=b.dataset.f===current&&!$("audio").paused;b.classList.toggle("on",on);b.innerHTML=on?"&#9646;&#9646;":"&#9654;";});
+["play","pause","ended"].forEach(ev=>$("audio").addEventListener(ev,marks));
 async function tick(){
  let s;try{s=await (await fetch("/api/state")).json();}catch(e){$("status").innerHTML='<span class="dot" style="background:var(--crit)"></span>dashboard unreachable';return;}
  const age=s.cc.age, ok=age!==null&&age<10;
  $("status").innerHTML='<span class="dot" style="background:'+(ok?"var(--good)":"var(--crit)")+'"></span>'+(ok?"control channel decoding":"no TSBK for "+(age===null?"ever":Math.round(age)+" s"))+" &middot; "+s.cc.total.toLocaleString()+" TSBKs &middot; "+s.p2.toLocaleString()+" Phase 2 MAC PDUs";
  $("k_rate").textContent=s.cc.rate60.toFixed(1);$("k_hops").textContent=s.hour.hops;$("k_clear").textContent=s.hour.clear;$("k_enc").textContent=s.hour.enc;$("k_unk").textContent=s.hour.unknown;
  const mx=Math.max(1,...s.cc.per_min);$("spark").innerHTML=s.cc.per_min.map(v=>'<div title="'+v.toFixed(1)+'/s" style="height:'+(100*v/mx)+'%"></div>').join("");
- $("hops").innerHTML=s.hops.map(h=>'<tr><td>'+tm(h.t)+'</td><td>'+tgl(h.tg,s.names[h.tg])+'</td><td>'+(h.hz/1e6).toFixed(4)+'</td><td>'+esc(h.slot)+'</td><td class="n">'+esc(h.dwell)+'</td><td>'+esc((h.why||"").replace(/_/g," "))+'</td><td>'+crypto(h.alg)+'</td><td class="n">'+esc(h.acch)+'</td><td>'+(h.audio&&h.audio!=="-"?player(h.audio):"")+'</td></tr>').join("")||'<tr><td colspan="9" style="color:var(--muted)">no calls followed yet</td></tr>';
+ $("hops").innerHTML=s.hops.map(h=>'<tr><td>'+tm(h.t)+'</td><td>'+tgl(h.tg,s.names[h.tg])+'</td><td>'+(h.hz/1e6).toFixed(4)+'</td><td>'+esc(h.slot)+'</td><td class="n">'+esc(h.dwell)+'</td><td>'+esc((h.why||"").replace(/_/g," "))+'</td><td>'+crypto(h.alg)+'</td><td class="n">'+esc(h.acch)+'</td><td>'+(h.audio&&h.audio!=="-"?player(h.audio,"tg "+h.tg+" @ "+(h.hz/1e6).toFixed(4)+" MHz, "+tm(h.t)):"")+'</td></tr>').join("")||'<tr><td colspan="9" style="color:var(--muted)">no calls followed yet</td></tr>';
  const gm=Math.max(1,...s.grants.map(g=>g.n));
  $("grants").innerHTML=s.grants.map(g=>'<tr><td>'+tgl(g.tg,g.name)+'</td><td style="width:45%"><div class="bar" style="width:'+(100*g.n/gm)+'%"></div></td><td class="n">'+g.n+'</td></tr>').join("")||'<tr><td style="color:var(--muted)">none yet</td></tr>';
- if(!playing)$("calls").innerHTML=s.calls.map(c=>'<tr><td>'+tm(c.t)+'</td><td>'+tgl(c.tg,c.name)+'</td><td>'+(c.hz/1e6).toFixed(4)+'</td><td class="n">'+c.s.toFixed(1)+'</td><td>'+crypto(c.tag==="clear"?"0x80":"-")+'</td><td>'+player(c.file)+'</td></tr>').join("")||'<tr><td colspan="6" style="color:var(--muted)">no recordings</td></tr>';
+ $("calls").innerHTML=s.calls.map(c=>'<tr><td>'+tm(c.t)+'</td><td>'+tgl(c.tg,c.name)+'</td><td>'+(c.hz/1e6).toFixed(4)+'</td><td class="n">'+c.s.toFixed(1)+'</td><td>'+crypto(c.tag==="clear"?"0x80":"-")+'</td><td>'+player(c.file,"tg "+c.tg+(c.name?" "+c.name:"")+" @ "+(c.hz/1e6).toFixed(4)+" MHz, "+tm(c.t))+'</td></tr>').join("")||'<tr><td colspan="6" style="color:var(--muted)">no recordings</td></tr>';
 }
-tick();setInterval(tick,2000);
+tick();setInterval(()=>{tick().then(marks);},2000);
 </script></body></html>"""
 
 
