@@ -312,6 +312,8 @@ fn main() -> std::io::Result<()> {
                 }
                 if Instant::now() >= v.until {
                     link.command(1, lo(cc_hz));
+                    #[allow(unused_mut)]
+                    let mut audio = String::from("-");
                     #[cfg(feature = "vocoder")]
                     if let Some((_, wav, path)) = v.audio.take() {
                         wav.finish()?;
@@ -319,7 +321,15 @@ fn main() -> std::io::Result<()> {
                         let fin = path.replace("_pending.wav", &format!("_{tag}.wav"));
                         std::fs::rename(&path, &fin)?;
                         eprintln!("swdr-tap: hop {hops} call audio -> {fin}");
+                        audio = fin.rsplit('/').next().unwrap_or("-").to_string();
                     }
+                    let (slots, good, acch) = v.p2.as_ref().map_or((0, 0, 0), |(_, p)| (p.slots, p.acch_good, p.acch));
+                    let ts = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs_f64();
+                    let alg = v.alg.map_or("-".to_string(), |a| format!("0x{a:02x}"));
+                    println!(
+                        "{ts:.3}	HOP {hops} end tg={} hz={} slot={} dwell={:.1} why={} alg={alg} acch={good}/{acch} slots={slots} audio={audio}",
+                        v.tg, v.hz, v.lch, v.start.elapsed().as_secs_f64(), v.why.replace(' ', "_")
+                    );
                     let (slots, good, acch) = v.p2.as_ref().map_or((0, 0, 0), |(_, p)| (p.slots, p.acch_good, p.acch));
                     eprintln!(
                         "swdr-tap: hop {hops} back to cc after {:.1}s ({}): tg={} {} Hz, {} frames, rms {:.1}, slots {slots}, ACCH {good}/{acch}, tg seen {}x",
@@ -346,6 +356,8 @@ fn main() -> std::io::Result<()> {
                         let path = format!("{hopdir}/hop_{hops}_tg{}_{}.u8", g.tg, g.hz);
                         link.command(1, lo(g.hz));
                         eprintln!("swdr-tap: hop {hops} tg={} ch={}-{} {} Hz slot {} -> {path}", g.tg, g.ch >> 12, g.ch & 0xFFF, g.hz, g.slot);
+                        let ts = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs_f64();
+                        println!("{ts:.3}	HOP {hops} start tg={} ch={}-{} hz={} slot={}", g.tg, g.ch >> 12, g.ch & 0xFFF, g.hz, g.slot);
                         let until = Instant::now() + std::time::Duration::from_secs_f64(dwell);
                         let p2 = match ids {
                             (Some(n), Some(s), Some(w)) => Some((cqpsk::Cqpsk::with_rate(fs, cqpsk::P2_SYM), p2::P2::new(n as u16, s as u16, w))),
