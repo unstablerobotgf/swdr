@@ -203,6 +203,7 @@ impl P2 {
     }
 
     fn reanchor(&mut self, p: u64) {
+        let fresh = self.anchor.is_none();
         let rel = match self.anchor {
             None => 0,
             Some((a, r)) => r + 4 * ((p as i64 - a as i64) as f64 / (4 * BURST) as f64).round() as i64,
@@ -210,7 +211,9 @@ impl P2 {
         self.anchor = Some((p, rel));
         // Continue after the last slot already cut, positioned on the new grid.
         let (_, nrel) = self.next;
-        let from = if self.slots == 0 || nrel < rel { rel } else { nrel };
+        // A fresh lock (first, or after the grid was lost) starts at the new pair; the old slot
+        // numbering means nothing then and would schedule the next cut far in the future.
+        let from = if fresh || nrel < rel { rel } else { nrel };
         let pos = p as i64 + (from - rel) * BURST as i64;
         self.next = (pos.max(self.hist0 as i64) as u64, from);
     }

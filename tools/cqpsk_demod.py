@@ -37,7 +37,7 @@ def gardner(y, sps, bw=0.01):
         cur, mid = interp(k), interp(k - w / 2)
         if prev is not None:
             e = np.real((prev - cur) * np.conj(mid)) / (abs(mid) ** 2 + abs(cur) ** 2 + 1e-9)
-            mu = mu + g2 * e
+            mu = min(2e-3, max(-2e-3, mu + g2 * e))  # clamp: unbounded it can false-lock while slipping
             k += w + sps * (g1 * e + mu)
         else:
             k += w

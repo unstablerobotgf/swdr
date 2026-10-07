@@ -174,7 +174,9 @@ impl Cqpsk {
             let mid = self.at(self.k - self.sps / 2.0);
             if let Some(prev) = self.prev {
                 let e = (C(prev.0 - cur.0, prev.1 - cur.1).mul(mid.conj())).0 / (mid.norm2() + cur.norm2() + 1e-9);
-                self.mu += g2 * e;
+                // Clock-rate integral, clamped to +-0.2%: real clocks are ppm apart, and unbounded
+                // it can run off to a false lock where the Gardner error averages zero while slipping.
+                self.mu = (self.mu + g2 * e).clamp(-2e-3, 2e-3);
                 self.k += self.sps + self.sps * (g1 * e + self.mu);
                 self.symbol(cur.mul(prev.conj()), out);
             } else {
